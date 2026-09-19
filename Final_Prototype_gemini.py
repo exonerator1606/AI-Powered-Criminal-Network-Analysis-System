@@ -4,14 +4,26 @@ import json
 import math
 import random
 import statistics
+import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import re
 import time
-import tkinter as tk
 from pathlib import Path
-from tkinter import filedialog, messagebox, simpledialog, ttk
 import os
+
+from PySide6.QtCore import Qt, QRectF, QPointF, QTimer, Signal
+from PySide6.QtGui import (
+    QAction, QBrush, QColor, QFont, QFontMetrics, QIcon, QPainter, QPen,
+    QPixmap, QPolygonF, QTextCursor,
+)
+from PySide6.QtWidgets import (
+    QAbstractItemView, QApplication, QDialog, QFileDialog, QFrame,
+    QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit, QMainWindow,
+    QMessageBox, QPushButton, QRadioButton, QScrollArea, QSizePolicy,
+    QStatusBar, QTabWidget, QTextEdit, QTreeWidget, QTreeWidgetItem,
+    QVBoxLayout, QWidget,
+)
 
 try:
     from google import genai
@@ -92,6 +104,776 @@ try:
     HAS_NEO4J_DRIVER = True
 except ImportError:
     HAS_NEO4J_DRIVER = False
+
+# ============================================================================
+#  QT (PySide6) COMPATIBILITY LAYER
+# ============================================================================
+#
+# This section replaces Tkinter with PySide6 *without* changing any of the
+# application's logic. It provides small shims that expose exactly the same
+# call signatures the rest of this file already uses:
+#
+#   Var                -> tk.StringVar      (.get() / .set())
+#   messagebox.*       -> tkinter.messagebox
+#   simpledialog.*     -> tkinter.simpledialog
+#   filedialog.*       -> tkinter.filedialog
+#   TextBox            -> tk.Text           (.insert/.delete/.see/.configure)
+#   PropertyTree       -> ttk.Treeview      (.insert/.get_children/.delete)
+#   CandidateTree      -> ttk.Treeview      (.insert/.selection/.delete)
+#   GraphCanvas        -> tk.Canvas         (.create_line/.create_oval/
+#                                            .create_text/.delete/
+#                                            .find_closest/.gettags/
+#                                            .winfo_width/.winfo_height/.bind)
+#   MainWindow.after   -> root.after        (thread-safe)
+#
+# Because the shims keep the original API, every analysis, import/export,
+# Neo4j, AI, anomaly and FIR method below is untouched.
+
+END = "end"
+LAST = "last"
+
+# ---------------------------------------------------------------- design ----
+# Visual language for an investigative console: dark instrument chrome so the
+# graph itself is the only bright surface, one signal-blue accent for actions,
+# and a single warm red reserved for destructive operations.
+C_CHROME = "#1b2027"
+C_PANEL = "#222a33"
+C_PANEL_HI = "#2b3542"
+C_LINE = "#39434f"
+C_INK = "#e7ecf3"
+C_INK_DIM = "#96a2b2"
+C_ACCENT = "#3d9be9"
+C_ACCENT_DEEP = "#2b7fc4"
+C_DANGER = "#d9534f"
+C_CANVAS = "#fbfcfd"
+
+UI_FONT = '"Segoe UI", "Inter", "Ubuntu", "Helvetica Neue", Arial, sans-serif'
+
+APP_STYLESHEET = f"""
+QWidget {{
+    background: {C_CHROME};
+    color: {C_INK};
+    font-family: {UI_FONT};
+    font-size: 12px;
+}}
+QMainWindow, QDialog {{ background: {C_CHROME}; }}
+
+QMenuBar {{
+    background: {C_CHROME};
+    color: {C_INK};
+    border-bottom: 1px solid {C_LINE};
+    padding: 2px 4px;
+}}
+QMenuBar::item {{ background: transparent; padding: 5px 11px; border-radius: 4px; }}
+QMenuBar::item:selected {{ background: {C_PANEL_HI}; }}
+QMenu {{
+    background: {C_PANEL};
+    border: 1px solid {C_LINE};
+    padding: 5px;
+}}
+QMenu::item {{ padding: 6px 22px 6px 14px; border-radius: 4px; }}
+QMenu::item:selected {{ background: {C_ACCENT_DEEP}; color: #ffffff; }}
+QMenu::separator {{ height: 1px; background: {C_LINE}; margin: 5px 8px; }}
+
+QLabel#section {{
+    color: {C_INK_DIM};
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 1.1px;
+    padding: 5px 0 5px 9px;
+    border-left: 2px solid {C_ACCENT};
+    background: transparent;
+}}
+QLabel#hint {{ color: {C_INK_DIM}; font-size: 11px; }}
+QLabel#activity {{ color: {C_INK_DIM}; font-size: 10px; }}
+
+QFrame#panel {{ background: {C_PANEL}; border: none; }}
+QFrame#rule {{ background: {C_LINE}; max-height: 1px; min-height: 1px; border: none; }}
+
+QPushButton {{
+    background: {C_PANEL_HI};
+    color: {C_INK};
+    border: 1px solid {C_LINE};
+    border-radius: 5px;
+    padding: 7px 10px;
+    text-align: left;
+}}
+QPushButton:hover {{ background: #374252; border-color: #4a5768; }}
+QPushButton:pressed {{ background: #2a333f; }}
+QPushButton:disabled {{ color: #64707f; background: #262e38; }}
+
+QPushButton#primary {{
+    background: {C_ACCENT_DEEP};
+    border: 1px solid {C_ACCENT};
+    color: #ffffff;
+    font-weight: 600;
+    text-align: center;
+}}
+QPushButton#primary:hover {{ background: {C_ACCENT}; }}
+QPushButton#primary:pressed {{ background: #24699f; }}
+
+QPushButton#danger {{
+    background: transparent;
+    border: 1px solid {C_DANGER};
+    color: #f0908d;
+    text-align: center;
+}}
+QPushButton#danger:hover {{ background: {C_DANGER}; color: #ffffff; }}
+
+QPushButton#quiet {{ text-align: center; }}
+
+QLineEdit {{
+    background: #1a2028;
+    border: 1px solid {C_LINE};
+    border-radius: 5px;
+    padding: 6px 8px;
+    selection-background-color: {C_ACCENT_DEEP};
+}}
+QLineEdit:focus {{ border-color: {C_ACCENT}; }}
+
+QTextEdit {{
+    background: #1a2028;
+    border: 1px solid {C_LINE};
+    border-radius: 5px;
+    padding: 6px;
+    selection-background-color: {C_ACCENT_DEEP};
+}}
+
+QRadioButton {{ padding: 4px 2px; spacing: 7px; }}
+QRadioButton::indicator {{ width: 13px; height: 13px; }}
+
+QTreeWidget {{
+    background: #1a2028;
+    alternate-background-color: #1e242d;
+    border: 1px solid {C_LINE};
+    border-radius: 5px;
+    outline: none;
+}}
+QTreeWidget::item {{ padding: 4px 6px; border: none; }}
+QTreeWidget::item:selected {{ background: {C_ACCENT_DEEP}; color: #ffffff; }}
+QHeaderView::section {{
+    background: {C_PANEL_HI};
+    color: {C_INK_DIM};
+    border: none;
+    border-right: 1px solid {C_LINE};
+    border-bottom: 1px solid {C_LINE};
+    padding: 6px 8px;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.7px;
+}}
+
+QTabWidget::pane {{ border: 1px solid {C_LINE}; border-radius: 5px; top: -1px; }}
+QTabBar::tab {{
+    background: {C_PANEL};
+    color: {C_INK_DIM};
+    border: 1px solid {C_LINE};
+    border-bottom: none;
+    border-top-left-radius: 5px;
+    border-top-right-radius: 5px;
+    padding: 7px 14px;
+    margin-right: 2px;
+}}
+QTabBar::tab:selected {{ background: {C_PANEL_HI}; color: {C_INK}; }}
+
+QScrollBar:vertical {{ background: transparent; width: 11px; margin: 0; }}
+QScrollBar::handle:vertical {{ background: #3f4a59; border-radius: 5px; min-height: 26px; }}
+QScrollBar::handle:vertical:hover {{ background: #4d5a6b; }}
+QScrollBar:horizontal {{ background: transparent; height: 11px; margin: 0; }}
+QScrollBar::handle:horizontal {{ background: #3f4a59; border-radius: 5px; min-width: 26px; }}
+QScrollBar::add-line, QScrollBar::sub-line {{ height: 0; width: 0; }}
+QScrollBar::add-page, QScrollBar::sub-page {{ background: transparent; }}
+
+QStatusBar {{ background: {C_PANEL}; border-top: 1px solid {C_LINE}; color: {C_INK_DIM}; }}
+QStatusBar::item {{ border: none; }}
+QStatusBar QLabel {{ padding: 4px 10px; color: {C_INK_DIM}; }}
+
+QScrollArea {{ border: none; }}
+QMessageBox {{ background: {C_PANEL}; }}
+QMessageBox QLabel {{ color: {C_INK}; }}
+QInputDialog {{ background: {C_PANEL}; }}
+"""
+
+
+# ------------------------------------------------------- GUI thread marshal --
+_GUI_WINDOW = None
+
+
+def _post_to_gui(fn):
+    """Run `fn` on the Qt GUI thread (safe to call from worker threads)."""
+    if _GUI_WINDOW is not None:
+        _GUI_WINDOW.invoke.emit(fn)
+    else:
+        fn()
+
+
+class Var:
+    """Drop-in replacement for tk.StringVar, optionally bound to a QLabel."""
+
+    def __init__(self, value=""):
+        self._value = str(value)
+        self._label = None
+
+    def bind_label(self, label):
+        self._label = label
+        label.setText(self._value)
+
+    def get(self):
+        return self._value
+
+    def _apply(self, label, text):
+        label.setText(text)
+        # Permanent status-bar labels do not always re-expand on their own when
+        # the text grows, which clips the tail of the string.
+        if label.property("fitContent"):
+            label.setMinimumWidth(
+                label.fontMetrics().horizontalAdvance(text) + 30)
+
+    def set(self, value):
+        self._value = str(value)
+        label = self._label
+        if label is not None:
+            _post_to_gui(lambda: self._apply(label, self._value))
+
+
+class RadioVar(Var):
+    """StringVar backed by a group of QRadioButtons (like tk.Radiobutton)."""
+
+    def __init__(self, value=""):
+        super().__init__(value)
+        self._buttons = {}
+
+    def bind_radios(self, buttons):
+        self._buttons = dict(buttons)
+        self._sync()
+
+    def _sync(self):
+        button = self._buttons.get(self._value)
+        if button is not None and not button.isChecked():
+            button.blockSignals(True)
+            button.setChecked(True)
+            button.blockSignals(False)
+
+    def set(self, value):
+        self._value = str(value)
+        _post_to_gui(self._sync)
+
+
+class EntryVar(Var):
+    """StringVar backed by a QLineEdit, so .get() reads the live text."""
+
+    def __init__(self, line_edit):
+        super().__init__("")
+        self._edit = line_edit
+
+    def get(self):
+        return self._edit.text()
+
+    def set(self, value):
+        self._value = str(value)
+        _post_to_gui(lambda: self._edit.setText(self._value))
+
+
+# ------------------------------------------------------------- dialog shims --
+def _active_parent():
+    return QApplication.activeWindow() or _GUI_WINDOW
+
+
+def _tk_filetypes_to_qt(filetypes):
+    """[('CSV files', '*.csv')] -> 'CSV files (*.csv);;All files (*)'"""
+    parts = []
+    for entry in filetypes or []:
+        try:
+            name, patterns = entry
+        except (TypeError, ValueError):
+            continue
+        if isinstance(patterns, (list, tuple)):
+            patterns = " ".join(patterns)
+        parts.append(f"{name} ({patterns})")
+    parts.append("All files (*)")
+    return ";;".join(parts)
+
+
+class messagebox:
+    """Subset of tkinter.messagebox backed by QMessageBox."""
+
+    @staticmethod
+    def _box(icon, title, message, buttons=None):
+        box = QMessageBox(_active_parent())
+        box.setIcon(icon)
+        box.setWindowTitle(str(title))
+        box.setText(str(message))
+        if buttons is not None:
+            box.setStandardButtons(buttons)
+        box.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        return box
+
+    @staticmethod
+    def showinfo(title, message, **_kw):
+        messagebox._box(QMessageBox.Information, title, message).exec()
+
+    @staticmethod
+    def showwarning(title, message, **_kw):
+        messagebox._box(QMessageBox.Warning, title, message).exec()
+
+    @staticmethod
+    def showerror(title, message, **_kw):
+        messagebox._box(QMessageBox.Critical, title, message).exec()
+
+    @staticmethod
+    def askyesno(title, message, **_kw):
+        box = messagebox._box(QMessageBox.Question, title, message,
+                              QMessageBox.Yes | QMessageBox.No)
+        box.setDefaultButton(QMessageBox.No)
+        return box.exec() == QMessageBox.Yes
+
+
+class simpledialog:
+    """Subset of tkinter.simpledialog backed by QInputDialog."""
+
+    @staticmethod
+    def askstring(title, prompt, initialvalue="", show=None, **_kw):
+        mode = QLineEdit.Password if show else QLineEdit.Normal
+        text, ok = QInputDialog.getText(
+            _active_parent(), str(title), str(prompt), mode, str(initialvalue or "")
+        )
+        return text if ok else None
+
+
+class filedialog:
+    """Subset of tkinter.filedialog backed by QFileDialog."""
+
+    @staticmethod
+    def askopenfilename(title="Open", filetypes=None, **_kw):
+        path, _ = QFileDialog.getOpenFileName(
+            _active_parent(), str(title), "", _tk_filetypes_to_qt(filetypes)
+        )
+        return path or ""
+
+    @staticmethod
+    def askopenfilenames(title="Open", filetypes=None, **_kw):
+        paths, _ = QFileDialog.getOpenFileNames(
+            _active_parent(), str(title), "", _tk_filetypes_to_qt(filetypes)
+        )
+        return tuple(paths or ())
+
+    @staticmethod
+    def asksaveasfilename(title="Save As", defaultextension="", filetypes=None, **_kw):
+        path, _ = QFileDialog.getSaveFileName(
+            _active_parent(), str(title), "", _tk_filetypes_to_qt(filetypes)
+        )
+        if path and defaultextension and not Path(path).suffix:
+            path += defaultextension
+        return path or ""
+
+
+# ------------------------------------------------------------ widget shims --
+class TextBox(QTextEdit):
+    """QTextEdit exposing the tk.Text calls used by this application."""
+
+    def __init__(self, parent=None, mono=False):
+        super().__init__(parent)
+        self.setReadOnly(True)
+        self.setLineWrapMode(QTextEdit.WidgetWidth)
+        if mono:
+            self.setFont(QFont("Consolas", 9))
+
+    def configure(self, state=None, **_kw):
+        if state == "normal":
+            self.setReadOnly(False)
+        elif state == "disabled":
+            self.setReadOnly(True)
+
+    def insert(self, index, text):
+        cursor = self.textCursor()
+        if str(index).startswith("1.0") or str(index).startswith("0.0"):
+            cursor.movePosition(QTextCursor.Start)
+        else:
+            cursor.movePosition(QTextCursor.End)
+        cursor.insertText(str(text))
+
+    def delete(self, _start=None, _end=None):
+        self.clear()
+
+    def see(self, _index=END):
+        self.verticalScrollBar().setValue(self.verticalScrollBar().maximum())
+
+
+class EntryBox(QLineEdit):
+    """QLineEdit exposing the tk.Entry calls used by this application."""
+
+    def get(self):
+        return self.text()
+
+    def delete(self, _first=0, _last=None):
+        self.clear()
+
+
+class _TreeShim(QTreeWidget):
+    """Shared ttk.Treeview-compatible behaviour."""
+
+    def insert(self, _parent, _index, values=(), **_kw):
+        item = QTreeWidgetItem([str(v) for v in values])
+        self.addTopLevelItem(item)
+        return item
+
+    def get_children(self, _item=None):
+        return [self.topLevelItem(i) for i in range(self.topLevelItemCount())]
+
+    def delete(self, item):
+        index = self.indexOfTopLevelItem(item)
+        if index >= 0:
+            self.takeTopLevelItem(index)
+
+    def selection(self):
+        return list(self.selectedItems())
+
+
+class PropertyTree(_TreeShim):
+    """Two-column property inspector (Property / Value)."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setColumnCount(2)
+        self.setHeaderLabels(["Property", "Value"])
+        self.setRootIsDecorated(False)
+        self.setAlternatingRowColors(True)
+        self.setSelectionMode(QAbstractItemView.SingleSelection)
+        header = self.header()
+        header.setSectionResizeMode(0, QHeaderView.Interactive)
+        header.setSectionResizeMode(1, QHeaderView.Stretch)
+        self.setColumnWidth(0, 200)
+
+
+class CandidateTree(_TreeShim):
+    """Multi-select candidate table used by the link-prediction window."""
+
+    def __init__(self, headings, parent=None):
+        super().__init__(parent)
+        self.setColumnCount(len(headings))
+        self.setHeaderLabels(list(headings))
+        self.setRootIsDecorated(False)
+        self.setAlternatingRowColors(True)
+        self.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        for i in range(len(headings)):
+            self.header().setSectionResizeMode(i, QHeaderView.Stretch)
+
+
+# ------------------------------------------------------------- graph canvas --
+class _Event:
+    """Mimics the (x, y) attributes of a Tkinter mouse event."""
+    __slots__ = ("x", "y")
+
+    def __init__(self, x, y):
+        self.x = x
+        self.y = y
+
+
+class _Item:
+    """One drawable primitive on the canvas, with Tkinter-style tags."""
+    __slots__ = ("kind", "coords", "opts", "tags")
+
+    def __init__(self, kind, coords, opts, tags):
+        self.kind = kind
+        self.coords = coords
+        self.opts = opts
+        self.tags = tuple(tags or ())
+
+
+def _font_from_spec(spec):
+    """('Arial', 8, 'bold') -> QFont."""
+    if not spec:
+        return QFont("Segoe UI", 9)
+    family = spec[0] if len(spec) > 0 else "Segoe UI"
+    size = int(spec[1]) if len(spec) > 1 else 9
+    style = str(spec[2]).lower() if len(spec) > 2 else ""
+    font = QFont(family, size)
+    font.setBold("bold" in style)
+    font.setItalic("italic" in style)
+    return font
+
+
+def _point_segment_distance(px, py, x1, y1, x2, y2):
+    dx, dy = x2 - x1, y2 - y1
+    if abs(dx) < 1e-9 and abs(dy) < 1e-9:
+        return math.hypot(px - x1, py - y1)
+    t = ((px - x1) * dx + (py - y1) * dy) / (dx * dx + dy * dy)
+    t = max(0.0, min(1.0, t))
+    return math.hypot(px - (x1 + t * dx), py - (y1 + t * dy))
+
+
+class GraphCanvas(QWidget):
+    """A repaint-on-demand canvas exposing the tk.Canvas API this app uses.
+
+    Keeping the create_line/create_oval/create_text/find_closest/gettags
+    surface means redraw_canvas(), _node_at() and _edge_at() keep working
+    exactly as they did under Tkinter, while rendering is now antialiased.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._items = []
+        self._handlers = {}
+        self.setMouseTracking(False)
+        self.setAutoFillBackground(True)
+        self.setCursor(Qt.CrossCursor)
+        self.setMinimumSize(320, 240)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
+    # -- tk.Canvas: item creation ------------------------------------------
+    def create_line(self, x1, y1, x2, y2, fill="#000000", width=1.0,
+                    dash=None, arrow=None, arrowshape=(8, 10, 3), tags=()):
+        item = _Item("line", (float(x1), float(y1), float(x2), float(y2)),
+                     {"fill": fill, "width": float(width), "dash": dash,
+                      "arrow": arrow, "arrowshape": arrowshape}, tags)
+        self._items.append(item)
+        return item
+
+    def create_oval(self, x1, y1, x2, y2, fill="#ffffff", outline="#000000",
+                    width=1.0, tags=()):
+        item = _Item("oval", (float(x1), float(y1), float(x2), float(y2)),
+                     {"fill": fill, "outline": outline, "width": float(width)}, tags)
+        self._items.append(item)
+        return item
+
+    def create_text(self, x, y, text="", fill="#000000", font=None,
+                    justify=None, tags=()):
+        item = _Item("text", (float(x), float(y)),
+                     {"text": str(text), "fill": fill, "font": font,
+                      "justify": justify}, tags)
+        self._items.append(item)
+        return item
+
+    def delete(self, which="all"):
+        if which == "all":
+            self._items = []
+        else:
+            self._items = [i for i in self._items if which not in i.tags]
+        self.update()
+
+    # -- tk.Canvas: hit testing --------------------------------------------
+    def _item_distance(self, item, x, y):
+        if item.kind == "line":
+            x1, y1, x2, y2 = item.coords
+            return _point_segment_distance(x, y, x1, y1, x2, y2)
+        if item.kind == "oval":
+            x1, y1, x2, y2 = item.coords
+            cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+            rx, ry = abs(x2 - x1) / 2.0, abs(y2 - y1) / 2.0
+            if rx < 1e-6 or ry < 1e-6:
+                return math.hypot(x - cx, y - cy)
+            norm = math.hypot((x - cx) / rx, (y - cy) / ry)
+            return 0.0 if norm <= 1.0 else (norm - 1.0) * min(rx, ry)
+        rect = self._text_rect(item)
+        dx = max(rect.left() - x, 0.0, x - rect.right())
+        dy = max(rect.top() - y, 0.0, y - rect.bottom())
+        return math.hypot(dx, dy)
+
+    def _text_rect(self, item):
+        metrics = QFontMetrics(_font_from_spec(item.opts.get("font")))
+        rect = metrics.boundingRect(item.opts.get("text", ""))
+        cx, cy = item.coords
+        return QRectF(cx - rect.width() / 2.0, cy - rect.height() / 2.0,
+                      max(rect.width(), 1), max(rect.height(), 1))
+
+    def find_closest(self, x, y):
+        """Return the topmost item nearest (x, y), as tk.Canvas does."""
+        best, best_distance = None, None
+        for item in reversed(self._items):
+            distance = self._item_distance(item, x, y)
+            if best_distance is None or distance < best_distance:
+                best, best_distance = item, distance
+        return best
+
+    def gettags(self, item):
+        return item.tags if isinstance(item, _Item) else ()
+
+    # -- tk widget geometry/event API --------------------------------------
+    def winfo_width(self):
+        return self.width()
+
+    def winfo_height(self):
+        return self.height()
+
+    def update_idletasks(self):
+        QApplication.processEvents()
+
+    def bind(self, sequence, handler):
+        self._handlers[sequence] = handler
+
+    def _dispatch(self, sequence, event):
+        handler = self._handlers.get(sequence)
+        if handler is not None:
+            handler(_Event(int(event.position().x()), int(event.position().y())))
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._dispatch("<ButtonPress-1>", event)
+        elif event.button() == Qt.RightButton:
+            self._dispatch("<Button-3>", event)
+
+    def mouseMoveEvent(self, event):
+        if event.buttons() & Qt.LeftButton:
+            self._dispatch("<B1-Motion>", event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._dispatch("<ButtonRelease-1>", event)
+
+    # -- rendering ----------------------------------------------------------
+    def paintEvent(self, _event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.setRenderHint(QPainter.TextAntialiasing, True)
+        painter.fillRect(self.rect(), QColor(C_CANVAS))
+        for item in self._items:
+            if item.kind == "line":
+                self._paint_line(painter, item)
+            elif item.kind == "oval":
+                self._paint_oval(painter, item)
+            else:
+                self._paint_text(painter, item)
+        painter.end()
+
+    def _paint_line(self, painter, item):
+        x1, y1, x2, y2 = item.coords
+        color = QColor(item.opts.get("fill") or "#000000")
+        width = max(float(item.opts.get("width") or 1.0), 0.6)
+        pen = QPen(color, width)
+        pen.setCapStyle(Qt.RoundCap)
+        dash = item.opts.get("dash")
+        if dash:
+            pen.setDashPattern([max(float(d) / width, 0.5) for d in dash])
+        painter.setPen(pen)
+        painter.setBrush(Qt.NoBrush)
+        painter.drawLine(QPointF(x1, y1), QPointF(x2, y2))
+        if item.opts.get("arrow") == LAST:
+            self._paint_arrowhead(painter, color, x1, y1, x2, y2,
+                                  item.opts.get("arrowshape") or (8, 10, 3))
+
+    @staticmethod
+    def _paint_arrowhead(painter, color, x1, y1, x2, y2, shape):
+        d1, d2, d3 = (float(v) for v in shape)
+        dx, dy = x2 - x1, y2 - y1
+        length = math.hypot(dx, dy)
+        if length < 1e-6:
+            return
+        ux, uy = dx / length, dy / length
+        px, py = -uy, ux
+        tip = QPointF(x2, y2)
+        neck = QPointF(x2 - ux * d1, y2 - uy * d1)
+        left = QPointF(x2 - ux * d2 + px * d3, y2 - uy * d2 + py * d3)
+        right = QPointF(x2 - ux * d2 - px * d3, y2 - uy * d2 - py * d3)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QBrush(color))
+        painter.drawPolygon(QPolygonF([tip, left, neck, right]))
+
+    @staticmethod
+    def _paint_oval(painter, item):
+        x1, y1, x2, y2 = item.coords
+        painter.setBrush(QBrush(QColor(item.opts.get("fill") or "#ffffff")))
+        pen = QPen(QColor(item.opts.get("outline") or "#000000"),
+                   max(float(item.opts.get("width") or 1.0), 0.6))
+        painter.setPen(pen)
+        painter.drawEllipse(QRectF(min(x1, x2), min(y1, y2),
+                                   abs(x2 - x1), abs(y2 - y1)))
+
+    def _paint_text(self, painter, item):
+        painter.setFont(_font_from_spec(item.opts.get("font")))
+        color = QColor(item.opts.get("fill") or "#000000")
+        cx, cy = item.coords
+        text = item.opts.get("text", "")
+        flags = Qt.AlignCenter | Qt.TextDontClip
+        rect = QRectF(cx - 600, cy - 300, 1200, 600)
+        # Light text over pastel entity fills needs a whisper of contrast to
+        # stay legible; this is a rendering aid only.
+        if color.lightnessF() > 0.7:
+            painter.setPen(QPen(QColor(0, 0, 0, 90)))
+            painter.drawText(rect.translated(0.7, 0.7), flags, text)
+        painter.setPen(QPen(color))
+        painter.drawText(rect, flags, text)
+
+
+# ------------------------------------------------------------- main window --
+class MainWindow(QMainWindow):
+    """QMainWindow providing the few `root` calls the application makes."""
+
+    invoke = Signal(object)
+
+    def __init__(self):
+        super().__init__()
+        self.analyst = None
+        self.invoke.connect(self._run_callable, Qt.QueuedConnection)
+
+    @staticmethod
+    def _run_callable(fn):
+        try:
+            fn()
+        except Exception:
+            pass
+
+    def after(self, delay_ms, callback):
+        """Thread-safe equivalent of Tkinter's root.after()."""
+        if delay_ms and delay_ms > 0:
+            QTimer.singleShot(int(delay_ms), lambda: self.invoke.emit(callback))
+        else:
+            self.invoke.emit(callback)
+
+    @staticmethod
+    def update_idletasks():
+        QApplication.processEvents()
+
+    def closeEvent(self, event):
+        if self.analyst is not None:
+            _on_close(self.analyst)
+        event.accept()
+
+
+# --------------------------------------------------------- layout helpers ---
+def section_label(text):
+    label = QLabel(text)
+    label.setObjectName("section")
+    return label
+
+
+def swatch_icon(color, size=11):
+    """Small colour chip so entity-type colour coding survives the restyle."""
+    pixmap = QPixmap(size, size)
+    pixmap.fill(Qt.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.Antialiasing, True)
+    painter.setPen(QPen(QColor(0, 0, 0, 60)))
+    painter.setBrush(QBrush(QColor(color)))
+    painter.drawRoundedRect(QRectF(0.5, 0.5, size - 1, size - 1), 2.5, 2.5)
+    painter.end()
+    return QIcon(pixmap)
+
+
+def make_button(text, on_click, object_name=None, icon=None, tooltip=None):
+    button = QPushButton(text)
+    if object_name:
+        button.setObjectName(object_name)
+    if icon is not None:
+        button.setIcon(icon)
+    if tooltip:
+        button.setToolTip(tooltip)
+    button.clicked.connect(lambda: on_click())
+    return button
+
+
+def vbox(widget, margins=(0, 0, 0, 0), spacing=6):
+    layout = QVBoxLayout(widget)
+    layout.setContentsMargins(*margins)
+    layout.setSpacing(spacing)
+    return layout
+
+
+def hbox(widget, margins=(0, 0, 0, 0), spacing=6):
+    layout = QHBoxLayout(widget)
+    layout.setContentsMargins(*margins)
+    layout.setSpacing(spacing)
+    return layout
+
 
 RANDOM_SEED = 42
 TEST_FRACTION = 0.2
@@ -422,7 +1204,7 @@ FULL_MULTI_AGENT = False
 # >>> PUT YOUR GEMINI API KEY HERE (between the quotes) <<<
 # Used automatically for the AI Copilot and handwritten-FIR OCR. If left empty,
 # the GEMINI_API_KEY environment variable is used instead.
-GEMINI_API_KEY = ""
+GEMINI_API_KEY = "AQ.Ab8RN6JAS7xbkch_dpMtOYbhDiKuOu4hGZim42U95--ZWnHiAQ"
 GEMINI_MODEL_DEFAULT = "gemini-3.6-flash"
 GEMINI_MAX_OUTPUT_TOKENS = 8192
 GEMINI_CONTEXT_CHARS = 20000                # max live-graph context sent per request
@@ -1535,9 +2317,10 @@ class Neo4jSync:
 class CriminalNetworkAnalyst:
     def __init__(self, root):
         self.root = root
-        self.root.title("Intelligence Analyst Workbench - SIH 2024 (Neo4j-backed, Spread + Multi-CSV)")
-        self.root.geometry("1400x850")
-        self.root.configure(bg="#f0f0f0")
+        self.root.setWindowTitle(
+            "Intelligence Analyst Workbench - SIH 2024 (Neo4j-backed, Spread + Multi-CSV)")
+        self.root.resize(1400, 850)
+        self.root.analyst = self
 
         # Core Graph Data Structure (Entity-Link-Property)
         # MultiGraph preserves multiple distinct links between the same nodes.
@@ -1559,8 +2342,8 @@ class CriminalNetworkAnalyst:
         # Status text is still tracked (used by the activity line / OCR), but the
         # AI backend controls are no longer shown in the UI: Gemini key + model
         # come from GEMINI_API_KEY / GEMINI_MODEL_DEFAULT in the code.
-        self.ai_status_var = tk.StringVar(value="● CHECKING AI")
-        self.ai_model_label_var = tk.StringVar(value="Gemini API")
+        self.ai_status_var = Var("● CHECKING AI")
+        self.ai_model_label_var = Var("Gemini API")
         self._ai_settings = {}
         self._apply_ai_settings()
         self._ai_busy = False
@@ -1591,68 +2374,75 @@ class CriminalNetworkAnalyst:
         self.root.after(250, self._check_ai_status_async)
 
     def setup_styles(self):
-        style = ttk.Style()
-        style.theme_use('clam')
-        style.configure("Treeview", font=("Segoe UI", 9), rowheight=25)
+        """Apply the workbench theme to the whole application."""
+        app = QApplication.instance()
+        if app is not None:
+            app.setStyleSheet(APP_STYLESHEET)
 
     def setup_menu(self):
-        menubar = tk.Menu(self.root)
+        menubar = self.root.menuBar()
+
+        def add_command(menu, label, command):
+            action = QAction(label, self.root)
+            action.triggered.connect(lambda _checked=False, c=command: c())
+            menu.addAction(action)
+            return action
 
         # FILE MENU
-        file_menu = tk.Menu(menubar, tearoff=0)
-        file_menu.add_command(label="Import Relationships (CSV)", command=self.import_relationships_csv)
-        file_menu.add_command(label="Import Entities (CSV)", command=self.import_entities_csv)
-        file_menu.add_command(label="Import NER / ML Output (JSON)", command=self.import_ner)
-        file_menu.add_command(label="Upload FIR / Investigation Document...", command=self.upload_fir)
-        file_menu.add_separator()
-        file_menu.add_command(label="Save Investigation (JSON)", command=self.save_investigation)
-        file_menu.add_command(label="Load Investigation (JSON)", command=self.load_investigation)
-        file_menu.add_separator()
-        file_menu.add_command(label="Export Investigation Report", command=self.export_report)
-        file_menu.add_separator()
-        file_menu.add_command(label="Clear Investigation", command=self.clear_investigation)
-        menubar.add_cascade(label="File", menu=file_menu)
+        file_menu = menubar.addMenu("File")
+        add_command(file_menu, "Import Relationships (CSV)", self.import_relationships_csv)
+        add_command(file_menu, "Import Entities (CSV)", self.import_entities_csv)
+        add_command(file_menu, "Import NER / ML Output (JSON)", self.import_ner)
+        add_command(file_menu, "Upload FIR / Investigation Document...", self.upload_fir)
+        file_menu.addSeparator()
+        add_command(file_menu, "Save Investigation (JSON)", self.save_investigation)
+        add_command(file_menu, "Load Investigation (JSON)", self.load_investigation)
+        file_menu.addSeparator()
+        add_command(file_menu, "Export Investigation Report", self.export_report)
+        file_menu.addSeparator()
+        add_command(file_menu, "Clear Investigation", self.clear_investigation)
 
         # NEO4J MENU
-        neo4j_menu = tk.Menu(menubar, tearoff=0)
-        neo4j_menu.add_command(label="Connect to Neo4j...", command=self.neo4j_connect_dialog)
-        neo4j_menu.add_command(label="Disconnect", command=self.neo4j_disconnect)
-        neo4j_menu.add_separator()
-        neo4j_menu.add_command(label="Push Current Graph to Neo4j", command=self.neo4j_push_graph)
-        neo4j_menu.add_command(label="Load Graph from Neo4j (replaces current)", command=self.neo4j_load_graph)
-        neo4j_menu.add_separator()
-        neo4j_menu.add_command(label="Clear Neo4j Database", command=self.neo4j_clear_remote)
-        menubar.add_cascade(label="Neo4j", menu=neo4j_menu)
+        neo4j_menu = menubar.addMenu("Neo4j")
+        add_command(neo4j_menu, "Connect to Neo4j...", self.neo4j_connect_dialog)
+        add_command(neo4j_menu, "Disconnect", self.neo4j_disconnect)
+        neo4j_menu.addSeparator()
+        add_command(neo4j_menu, "Push Current Graph to Neo4j", self.neo4j_push_graph)
+        add_command(neo4j_menu, "Load Graph from Neo4j (replaces current)", self.neo4j_load_graph)
+        neo4j_menu.addSeparator()
+        add_command(neo4j_menu, "Clear Neo4j Database", self.neo4j_clear_remote)
 
         # ANALYSIS MENU
-        analysis_menu = tk.Menu(menubar, tearoff=0)
-        analysis_menu.add_command(label="Calculate Centrality (Key Players)", command=self.analyze_influencers)
-        analysis_menu.add_command(label="Detect Communities (Clusters)", command=self.detect_communities)
-        analysis_menu.add_command(label="Find Shortest Path (Money Trail)", command=self.enable_path_mode)
-        analysis_menu.add_separator()
-        analysis_menu.add_command(label="Run Link Prediction (Multilayer)", command=self.run_link_prediction)
-        analysis_menu.add_command(label="Detect 12 Anomaly Types", command=self.run_anomaly_detection)
-        analysis_menu.add_separator()
-        analysis_menu.add_command(label="AI Investigation Briefing", command=self.ai_explain_selected)
-        analysis_menu.add_command(label="AI Copilot Status", command=self.show_ai_status)
-        menubar.add_cascade(label="Analysis", menu=analysis_menu)
+        analysis_menu = menubar.addMenu("Analysis")
+        add_command(analysis_menu, "Calculate Centrality (Key Players)", self.analyze_influencers)
+        add_command(analysis_menu, "Detect Communities (Clusters)", self.detect_communities)
+        add_command(analysis_menu, "Find Shortest Path (Money Trail)", self.enable_path_mode)
+        analysis_menu.addSeparator()
+        add_command(analysis_menu, "Run Link Prediction (Multilayer)", self.run_link_prediction)
+        add_command(analysis_menu, "Detect 12 Anomaly Types", self.run_anomaly_detection)
+        analysis_menu.addSeparator()
+        add_command(analysis_menu, "AI Investigation Briefing", self.ai_explain_selected)
+        add_command(analysis_menu, "AI Copilot Status", self.show_ai_status)
 
         # VIEW MENU
-        view_menu = tk.Menu(menubar, tearoff=0)
-        view_menu.add_command(label="Auto Layout", command=self.auto_layout)
-        view_menu.add_separator()
-        view_menu.add_command(label="Spread Layout", command=self.auto_layout)
-        menubar.add_cascade(label="View", menu=view_menu)
-
-        self.root.config(menu=menubar)
+        view_menu = menubar.addMenu("View")
+        add_command(view_menu, "Auto Layout", self.auto_layout)
+        view_menu.addSeparator()
+        add_command(view_menu, "Spread Layout", self.auto_layout)
 
     def setup_layout(self):
-        # --- LEFT PANEL: Entity Toolbox ---
-        self.left_panel = tk.Frame(self.root, width=200, bg="#d9d9d9", relief=tk.RAISED, bd=1)
-        self.left_panel.pack(side=tk.LEFT, fill=tk.Y)
+        central = QWidget()
+        root_row = hbox(central, margins=(0, 0, 0, 0), spacing=0)
+        self.root.setCentralWidget(central)
 
-        tk.Label(self.left_panel, text="ENTITY TOOLBOX", bg="#404040", fg="white",
-                 font=("Arial", 10, "bold")).pack(fill=tk.X)
+        # --- LEFT PANEL: Entity Toolbox ---
+        self.left_panel = QFrame()
+        self.left_panel.setObjectName("panel")
+        self.left_panel.setFixedWidth(224)
+        left = vbox(self.left_panel, margins=(12, 12, 12, 12), spacing=5)
+        root_row.addWidget(self.left_panel)
+
+        left.addWidget(section_label("ENTITY TOOLBOX"))
 
         entities = [
             ("Suspect", "#ff9999"),
@@ -1665,99 +2455,124 @@ class CriminalNetworkAnalyst:
         ]
 
         for name, color in entities:
-            btn = tk.Button(self.left_panel, text=f"+ Add {name}", bg=color, relief=tk.GROOVE,
-                             command=lambda n=name: self.add_new_entity_at_center(n))
-            btn.pack(fill=tk.X, padx=10, pady=3)
+            btn = make_button(
+                f"+ Add {name}",
+                lambda n=name: self.add_new_entity_at_center(n),
+                icon=swatch_icon(color),
+            )
+            left.addWidget(btn)
 
-        tk.Label(self.left_panel, text="MODE", bg="#404040", fg="white",
-                 font=("Arial", 10, "bold")).pack(fill=tk.X, pady=(15, 0))
+        left.addSpacing(10)
+        left.addWidget(section_label("MODE"))
 
-        self.mode_var = tk.StringVar(value="select")
-        tk.Radiobutton(self.left_panel, text="Select / Drag", variable=self.mode_var, value="select",
-                       command=lambda: self.set_mode("select"), bg="#d9d9d9", anchor="w").pack(fill=tk.X, padx=10)
-        tk.Radiobutton(self.left_panel, text="Create Link", variable=self.mode_var, value="link",
-                       command=lambda: self.set_mode("link"), bg="#d9d9d9", anchor="w").pack(fill=tk.X, padx=10)
+        self.mode_var = RadioVar("select")
+        select_radio = QRadioButton("Select / Drag")
+        link_radio = QRadioButton("Create Link")
+        select_radio.setChecked(True)
+        select_radio.toggled.connect(
+            lambda checked: self.set_mode("select") if checked else None)
+        link_radio.toggled.connect(
+            lambda checked: self.set_mode("link") if checked else None)
+        self.mode_var.bind_radios({"select": select_radio, "link": link_radio})
+        left.addWidget(select_radio)
+        left.addWidget(link_radio)
 
-        tk.Label(self.left_panel, text="FIND ENTITY", bg="#404040", fg="white",
-                 font=("Arial", 10, "bold")).pack(fill=tk.X, pady=(15, 0))
-        self.search_var = tk.StringVar()
-        search_entry = tk.Entry(self.left_panel, textvariable=self.search_var)
-        search_entry.pack(fill=tk.X, padx=10, pady=5)
-        search_entry.bind("<Return>", lambda e: self.find_entity(self.search_var.get()))
-        tk.Button(self.left_panel, text="Search", command=lambda: self.find_entity(self.search_var.get())).pack(
-            fill=tk.X, padx=10)
+        left.addSpacing(10)
+        left.addWidget(section_label("FIND ENTITY"))
+        search_entry = QLineEdit()
+        search_entry.setPlaceholderText("Entity label")
+        self.search_var = EntryVar(search_entry)
+        search_entry.returnPressed.connect(
+            lambda: self.find_entity(self.search_var.get()))
+        left.addWidget(search_entry)
+        left.addWidget(make_button(
+            "Search", lambda: self.find_entity(self.search_var.get()),
+            object_name="quiet"))
 
-        tk.Label(self.left_panel, text="DATA IN", bg="#404040", fg="white",
-                 font=("Arial", 10, "bold")).pack(fill=tk.X, pady=(15, 0))
-        tk.Button(self.left_panel, text="Import Relationships (CSV)",
-                  command=self.import_relationships_csv).pack(fill=tk.X, padx=10, pady=(5, 2))
-        tk.Button(self.left_panel, text="Import Entities (CSV)",
-                  command=self.import_entities_csv).pack(fill=tk.X, padx=10, pady=2)
+        left.addSpacing(10)
+        left.addWidget(section_label("DATA IN"))
+        left.addWidget(make_button("Import Relationships (CSV)",
+                                   self.import_relationships_csv))
+        left.addWidget(make_button("Import Entities (CSV)",
+                                   self.import_entities_csv))
 
-        tk.Label(self.left_panel, text="LINK PREDICTION", bg="#404040", fg="white",
-                 font=("Arial", 10, "bold")).pack(fill=tk.X, pady=(15, 0))
-        tk.Button(self.left_panel, text="Run Link Prediction", bg="#66cccc",
-                  command=self.run_link_prediction).pack(fill=tk.X, padx=10, pady=5)
+        left.addSpacing(10)
+        left.addWidget(section_label("LINK PREDICTION"))
+        left.addWidget(make_button("Run Link Prediction", self.run_link_prediction,
+                                   object_name="primary"))
+
+        left.addStretch(1)
+
         # Separate controls so Inspector and AI Copilot can be shown/hidden independently.
         self.inspector_visible = True
         self.ai_panel_visible = True
 
-        self.toggle_inspector_btn = tk.Button(
-            self.left_panel,
-            text="Hide Inspector",
-            command=self.toggle_inspector,
-            bg="#bbbbbb"
-        )
-        self.toggle_inspector_btn.pack(fill=tk.X, padx=10, pady=(8, 2))
+        self.toggle_inspector_btn = make_button(
+            "Hide Inspector", self.toggle_inspector, object_name="quiet")
+        left.addWidget(self.toggle_inspector_btn)
 
-        self.toggle_ai_btn = tk.Button(
-            self.left_panel,
-            text="Hide AI Copilot",
-            command=self.toggle_ai_copilot,
-            bg="#bbbbbb"
-        )
-        self.toggle_ai_btn.pack(fill=tk.X, padx=10, pady=(2, 5))
+        self.toggle_ai_btn = make_button(
+            "Hide AI Copilot", self.toggle_ai_copilot, object_name="quiet")
+        left.addWidget(self.toggle_ai_btn)
 
-        # --- RIGHT PANEL: AI Copilot (vertical) ---
-        # AI Copilot occupies the full-height right side.
-        self.right_panel = tk.Frame(self.root, width=430, bg="#d9d9d9", relief=tk.RAISED, bd=1)
-        self.right_panel.pack(side=tk.RIGHT, fill=tk.Y)
-        self.right_panel.pack_propagate(False)
-
-        self.ai_tab = tk.Frame(self.right_panel, bg="#d9d9d9")
-        self.ai_tab.pack(fill=tk.BOTH, expand=True)
-        self._build_ai_panel()
-
-        # --- CENTER: Canvas + bottom Property Inspector + status bar ---
-        # The inspector belongs to the graph area, not the whole root window.
-        # This keeps AI Copilot vertical on the right while the inspector sits
+        # --- CENTER: Canvas + bottom Property Inspector ---
+        # The inspector belongs to the graph area, not the whole window, so the
+        # AI Copilot stays vertical on the right while the inspector sits
         # horizontally below the graph.
-        center = tk.Frame(self.root)
-        center.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        center = QWidget()
+        center_col = vbox(center, margins=(0, 0, 0, 0), spacing=0)
+        root_row.addWidget(center, 1)
+
+        self.canvas = GraphCanvas()
+        center_col.addWidget(self.canvas, 1)
 
         # Keep the inspector shallow so it does not consume much graph height.
-        self.inspector_tab = tk.Frame(center, height=185, bg="#d9d9d9", relief=tk.RAISED, bd=1)
-        self.inspector_tab.pack(side=tk.BOTTOM, fill=tk.X)
-        self.inspector_tab.pack_propagate(False)
+        self.inspector_tab = QFrame()
+        self.inspector_tab.setObjectName("panel")
+        self.inspector_tab.setFixedHeight(200)
+        inspector_col = vbox(self.inspector_tab, margins=(12, 8, 12, 10), spacing=6)
 
-        tk.Label(self.inspector_tab, text="PROPERTY INSPECTOR", bg="#404040", fg="white",
-                 font=("Arial", 10, "bold")).pack(fill=tk.X)
-        self.prop_tree = ttk.Treeview(self.inspector_tab, columns=("Property", "Value"), show="headings")
-        self.prop_tree.heading("Property", text="Property")
-        self.prop_tree.heading("Value", text="Value")
-        self.prop_tree.column("Property", width=180, minwidth=140, stretch=False)
-        self.prop_tree.column("Value", width=700, minwidth=250, stretch=True)
-        self.prop_tree.pack(fill=tk.BOTH, expand=True)
+        inspector_head = QWidget()
+        inspector_head_row = hbox(inspector_head)
+        inspector_head_row.addWidget(section_label("PROPERTY INSPECTOR"))
+        inspector_head_row.addStretch(1)
+        delete_btn = make_button("Delete Selected Entity", self.delete_selected_node,
+                                 object_name="danger")
+        delete_btn.setFixedWidth(180)
+        inspector_head_row.addWidget(delete_btn)
+        inspector_col.addWidget(inspector_head)
 
-        tk.Button(self.inspector_tab, text="Delete Selected Entity", bg="#ff6666",
-                  command=self.delete_selected_node).pack(fill=tk.X, padx=5, pady=5)
+        self.prop_tree = PropertyTree()
+        inspector_col.addWidget(self.prop_tree, 1)
 
-        self.status_var = tk.StringVar(
-            value="No data loaded. Use File > Import Relationships (CSV) to begin, "
-                  "or add entities from the toolbox.")
+        center_col.addWidget(self.inspector_tab)
 
-        self.canvas = tk.Canvas(center, bg="white", bd=2, relief=tk.SUNKEN, cursor="cross")
-        self.canvas.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        # --- RIGHT PANEL: AI Copilot (vertical, full height) ---
+        self.right_panel = QFrame()
+        self.right_panel.setObjectName("panel")
+        self.right_panel.setFixedWidth(430)
+        right_col = vbox(self.right_panel, margins=(0, 0, 0, 0), spacing=0)
+        root_row.addWidget(self.right_panel)
+
+        self.ai_tab = QWidget()
+        right_col.addWidget(self.ai_tab, 1)
+        self._build_ai_panel()
+
+        # --- STATUS BAR ---
+        self.status_var = Var(
+            "No data loaded. Use File > Import Relationships (CSV) to begin, "
+            "or add entities from the toolbox.")
+        status_bar = QStatusBar()
+        status_bar.setSizeGripEnabled(False)
+        status_bar.setContentsMargins(6, 0, 10, 0)
+        self.root.setStatusBar(status_bar)
+        status_label = QLabel()
+        self.status_var.bind_label(status_label)
+        status_bar.addWidget(status_label, 1)
+        ai_status_label = QLabel()
+        ai_status_label.setProperty("fitContent", True)
+        self.ai_status_var.bind_label(ai_status_label)
+        status_bar.addPermanentWidget(ai_status_label)
 
         self.canvas.bind("<ButtonPress-1>", self.on_canvas_click)
         self.canvas.bind("<B1-Motion>", self.on_canvas_drag)
@@ -1768,26 +2583,26 @@ class CriminalNetworkAnalyst:
     def toggle_inspector(self):
         """Show or hide only the Property Inspector."""
         if self.inspector_visible:
-            self.inspector_tab.pack_forget()
+            self.inspector_tab.setVisible(False)
             self.inspector_visible = False
-            self.toggle_inspector_btn.config(text="Show Inspector")
+            self.toggle_inspector_btn.setText("Show Inspector")
         else:
-            self.inspector_tab.pack(side=tk.BOTTOM, fill=tk.X)
+            self.inspector_tab.setVisible(True)
             self.inspector_visible = True
-            self.toggle_inspector_btn.config(text="Hide Inspector")
+            self.toggle_inspector_btn.setText("Hide Inspector")
         self.root.update_idletasks()
         self.auto_layout()
 
     def toggle_ai_copilot(self):
         """Show or hide only the AI Copilot."""
         if self.ai_panel_visible:
-            self.ai_tab.pack_forget()
+            self.right_panel.setVisible(False)
             self.ai_panel_visible = False
-            self.toggle_ai_btn.config(text="Show AI Copilot")
+            self.toggle_ai_btn.setText("Show AI Copilot")
         else:
-            self.ai_tab.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+            self.right_panel.setVisible(True)
             self.ai_panel_visible = True
-            self.toggle_ai_btn.config(text="Hide AI Copilot")
+            self.toggle_ai_btn.setText("Hide AI Copilot")
         self.root.update_idletasks()
         self.auto_layout()
 
@@ -2304,7 +3119,7 @@ class CriminalNetworkAnalyst:
                 self.canvas.create_line(
                     x1 + ox, y1 + oy, x2 + ox, y2 + oy,
                     fill=fill, width=width, dash=dash,
-                    arrow=tk.LAST, arrowshape=(8, 10, 3),
+                    arrow=LAST, arrowshape=(8, 10, 3),
                     tags=(tag, "edge")
                 )
 
@@ -2511,17 +3326,17 @@ class CriminalNetworkAnalyst:
             return
 
         data = self.G.nodes[node_id]
-        self.prop_tree.insert("", tk.END, values=("System ID", node_id))
+        self.prop_tree.insert("", END, values=("System ID", node_id))
 
         properties = data.get("properties", {})
         if properties:
             for key, value in properties.items():
-                self.prop_tree.insert("", tk.END, values=(str(key), str(value)))
+                self.prop_tree.insert("", END, values=(str(key), str(value)))
         else:
-            self.prop_tree.insert("", tk.END, values=("Label", data.get("label", node_id)))
-            self.prop_tree.insert("", tk.END, values=("Entity Type", data.get("type", "Entity")))
+            self.prop_tree.insert("", END, values=("Label", data.get("label", node_id)))
+            self.prop_tree.insert("", END, values=("Entity Type", data.get("type", "Entity")))
 
-        self.prop_tree.insert("", tk.END, values=("Direct Links", self.G.degree(node_id)))
+        self.prop_tree.insert("", END, values=("Direct Links", self.G.degree(node_id)))
 
         self._insert_centrality_rows(data)
 
@@ -2534,30 +3349,30 @@ class CriminalNetworkAnalyst:
                 "closeness_centrality", "eigenvector_centrality",
             )
         )
-        self.prop_tree.insert("", tk.END, values=("— Centrality —", ""))
+        self.prop_tree.insert("", END, values=("— Centrality —", ""))
         if not has_metrics:
             self.prop_tree.insert(
-                "", tk.END,
+                "", END,
                 values=("(not calculated)", "Run Analysis > Calculate Centrality")
             )
             return
 
         self.prop_tree.insert(
-            "", tk.END, values=("Degree Centrality", f"{data.get('degree_centrality', 0.0):.4f}")
+            "", END, values=("Degree Centrality", f"{data.get('degree_centrality', 0.0):.4f}")
         )
         self.prop_tree.insert(
-            "", tk.END, values=("Weighted Degree", f"{data.get('weighted_degree', 0.0):.4f}")
+            "", END, values=("Weighted Degree", f"{data.get('weighted_degree', 0.0):.4f}")
         )
         self.prop_tree.insert(
-            "", tk.END,
+            "", END,
             values=("Betweenness Centrality", f"{data.get('betweenness_centrality', 0.0):.4f}")
         )
         self.prop_tree.insert(
-            "", tk.END,
+            "", END,
             values=("Closeness Centrality", f"{data.get('closeness_centrality', 0.0):.4f}")
         )
         self.prop_tree.insert(
-            "", tk.END,
+            "", END,
             values=("Eigenvector Centrality", f"{data.get('eigenvector_centrality', 0.0):.4f}")
         )
 
@@ -2571,24 +3386,24 @@ class CriminalNetworkAnalyst:
         relation = data.get("label", "Linked to")
         count = int(data.get("count", 1))
 
-        self.prop_tree.insert("", tk.END, values=("Relationship", relation))
-        self.prop_tree.insert("", tk.END, values=("Relationship Count", count))
-        self.prop_tree.insert("", tk.END,
+        self.prop_tree.insert("", END, values=("Relationship", relation))
+        self.prop_tree.insert("", END, values=("Relationship Count", count))
+        self.prop_tree.insert("", END,
                               values=("From", self.G.nodes[node_u].get("label", node_u)))
-        self.prop_tree.insert("", tk.END,
+        self.prop_tree.insert("", END,
                               values=("To", self.G.nodes[node_v].get("label", node_v)))
 
         # Show the latest/representative properties directly.
         properties = data.get("properties", {})
         for k, v in properties.items():
-            self.prop_tree.insert("", tk.END, values=(str(k), str(v)))
+            self.prop_tree.insert("", END, values=(str(k), str(v)))
 
         # If multiple observations were aggregated, expose each record in a
         # compact, readable form instead of creating separate visual edges.
         records = data.get("records", [])
         if len(records) > 1:
-            self.prop_tree.insert("", tk.END, values=("—", "—"))
-            self.prop_tree.insert("", tk.END,
+            self.prop_tree.insert("", END, values=("—", "—"))
+            self.prop_tree.insert("", END,
                                   values=("Individual Records", len(records)))
             for i, record in enumerate(records, 1):
                 summary = "; ".join(
@@ -2598,7 +3413,7 @@ class CriminalNetworkAnalyst:
                 if len(summary) > 220:
                     summary = summary[:217] + "..."
                 self.prop_tree.insert(
-                    "", tk.END, values=(f"Record {i}", summary)
+                    "", END, values=(f"Record {i}", summary)
                 )
 
     # ========================== ANALYSIS & MENU ACTIONS ==========================
@@ -2796,51 +3611,53 @@ class CriminalNetworkAnalyst:
                                            "\n".join(log_lines))
 
     def show_link_prediction_results(self, results, layers, metadata, node_types, all_nodes, log_text):
-        win = tk.Toplevel(self.root)
-        win.title("Link Prediction Results - Candidate New Links")
-        win.geometry("900x600")
+        win = QDialog(self.root)
+        win.setWindowTitle("Link Prediction Results - Candidate New Links")
+        win.resize(900, 620)
+        win.setWindowFlag(Qt.WindowMinMaxButtonsHint, True)
+        outer = vbox(win, margins=(14, 12, 14, 14), spacing=8)
 
-        tk.Label(win, text="MULTILAYER LINK PREDICTION", bg="#404040", fg="white",
-                 font=("Arial", 11, "bold")).pack(fill=tk.X)
+        outer.addWidget(section_label("MULTILAYER LINK PREDICTION"))
 
-        log_box = tk.Text(win, height=6, wrap="word", bg="#f5f5f5")
+        log_box = TextBox(mono=True)
+        log_box.setFixedHeight(110)
         log_box.insert("1.0", log_text)
         log_box.configure(state="disabled")
-        log_box.pack(fill=tk.X, padx=5, pady=5)
+        outer.addWidget(log_box)
 
-        notebook = ttk.Notebook(win)
-        notebook.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        notebook = QTabWidget()
+        outer.addWidget(notebook, 1)
 
         for relation, result in results.items():
             candidates = top_k_candidates(
                 result, layers, all_nodes, metadata[relation], node_types, relation, k=8)
 
-            tab = tk.Frame(notebook)
-            notebook.add(tab, text=relation)
+            tab = QWidget()
+            tab_col = vbox(tab, margins=(10, 10, 10, 10), spacing=8)
+            notebook.addTab(tab, relation)
 
             metrics = (f"ROC-AUC: {result['auc']:.3f}   |   Average Precision: {result['ap']:.3f}   |   "
                        f"evaluated on {result['n_pos']} held-out pos / {result['n_neg']} neg links")
-            tk.Label(tab, text=metrics, anchor="w", font=("Arial", 9, "italic")).pack(fill=tk.X, padx=5, pady=(5, 0))
+            metrics_label = QLabel(metrics)
+            metrics_label.setObjectName("hint")
+            tab_col.addWidget(metrics_label)
 
-            columns = ("entity_a", "type_a", "entity_b", "type_b", "prob")
-            tree = ttk.Treeview(tab, columns=columns, show="headings", selectmode="extended")
-            headings = {"entity_a": "Entity A", "type_a": "Type A", "entity_b": "Entity B",
-                        "type_b": "Type B", "prob": "Predicted Prob."}
-            for c in columns:
-                tree.heading(c, text=headings[c])
-                tree.column(c, width=140 if c != "prob" else 110, anchor="w")
-            tree.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+            headings = ["Entity A", "Type A", "Entity B", "Type B", "Predicted Prob."]
+            tree = CandidateTree(headings)
+            tab_col.addWidget(tree, 1)
 
             candidate_map = {}
             if not candidates:
-                tk.Label(tab, text="No eligible candidate pairs found for this relation.",
-                         fg="#888888").pack(pady=10)
+                empty = QLabel("No eligible candidate pairs found for this relation.")
+                empty.setObjectName("hint")
+                empty.setAlignment(Qt.AlignCenter)
+                tab_col.addWidget(empty)
             for u, v, prob in candidates:
                 label_u = self.G.nodes[u]['label'] if u in self.G.nodes else u
                 label_v = self.G.nodes[v]['label'] if v in self.G.nodes else v
                 type_u = node_types.get(u, "Entity")
                 type_v = node_types.get(v, "Entity")
-                iid = tree.insert("", tk.END, values=(label_u, type_u, label_v, type_v, f"{prob:.3f}"))
+                iid = tree.insert("", END, values=(label_u, type_u, label_v, type_v, f"{prob:.3f}"))
                 candidate_map[iid] = (u, v, prob)
 
             def make_add_handler(tree=tree, candidate_map=candidate_map, relation=relation):
@@ -2861,10 +3678,16 @@ class CriminalNetworkAnalyst:
                                          "graph (shown as dashed lines).")
                 return add_selected
 
-            btn_row = tk.Frame(tab)
-            btn_row.pack(fill=tk.X, padx=5, pady=(0, 5))
-            tk.Button(btn_row, text="Add Selected as Predicted Link(s)", bg="#66cccc",
-                      command=make_add_handler()).pack(side=tk.LEFT)
+            btn_row = QWidget()
+            btn_row_layout = hbox(btn_row)
+            add_button = make_button("Add Selected as Predicted Link(s)",
+                                     make_add_handler(), object_name="primary")
+            btn_row_layout.addWidget(add_button)
+            btn_row_layout.addStretch(1)
+            tab_col.addWidget(btn_row)
+
+        self._link_prediction_window = win
+        win.show()
 
     # ========================== NEO4J ACTIONS ==========================
 
@@ -3498,30 +4321,35 @@ class CriminalNetworkAnalyst:
 
     def _build_ai_panel(self):
         """Build the AI Copilot inside the existing right-side panel."""
-        tk.Label(self.ai_tab, text="AI SPECIALISTS", bg="#404040", fg="white",
-                 font=("Arial", 9, "bold")).pack(fill=tk.X, pady=(6, 0))
-        self.ai_agents_box = tk.Text(self.ai_tab, height=4, wrap="word", bg="#f5f5f5",
-                                     fg="black", relief=tk.SUNKEN, bd=1, font=("Arial", 8))
-        self.ai_agents_box.pack(fill=tk.X, padx=5, pady=4)
+        column = vbox(self.ai_tab, margins=(12, 12, 12, 10), spacing=6)
+
+        column.addWidget(section_label("AI SPECIALISTS"))
+        self.ai_agents_box = TextBox()
+        self.ai_agents_box.setFixedHeight(84)
+        column.addWidget(self.ai_agents_box)
         self._render_ai_agents()
 
-        fir_row = tk.Frame(self.ai_tab, bg="#d9d9d9")
-        fir_row.pack(fill=tk.X, padx=5, pady=(2, 4))
-        tk.Button(fir_row, text="📄 UPLOAD HANDWRITTEN FIR", bg="#66cccc",
-                  command=self.upload_fir).pack(fill=tk.X)
+        column.addWidget(make_button("Upload handwritten FIR", self.upload_fir,
+                                     object_name="primary"))
 
-        action_row = tk.Frame(self.ai_tab, bg="#d9d9d9")
-        action_row.pack(fill=tk.X, padx=5, pady=2)
-        tk.Button(action_row, text="Explain Score", bg="#66cccc", command=self.ai_explain_selected).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(0, 2))
-        tk.Button(action_row, text="Find Anomalies", command=self.run_anomaly_detection).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(2, 0))
+        action_row = QWidget()
+        action_layout = hbox(action_row, spacing=6)
+        action_layout.addWidget(make_button("Explain Score", self.ai_explain_selected,
+                                            object_name="quiet"))
+        action_layout.addWidget(make_button("Find Anomalies", self.run_anomaly_detection,
+                                            object_name="quiet"))
+        column.addWidget(action_row)
 
-        action_row2 = tk.Frame(self.ai_tab, bg="#d9d9d9")
-        action_row2.pack(fill=tk.X, padx=5, pady=2)
-        tk.Button(action_row2, text="Show Evidence", command=self.ai_show_evidence).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(0, 2))
-        tk.Button(action_row2, text="Challenge AI", command=self.ai_challenge).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(2, 0))
+        action_row2 = QWidget()
+        action_layout2 = hbox(action_row2, spacing=6)
+        action_layout2.addWidget(make_button("Show Evidence", self.ai_show_evidence,
+                                             object_name="quiet"))
+        action_layout2.addWidget(make_button("Challenge AI", self.ai_challenge,
+                                             object_name="quiet"))
+        column.addWidget(action_row2)
 
-        tk.Label(self.ai_tab, text="SUGGESTED QUESTIONS", bg="#404040", fg="white",
-                 font=("Arial", 9, "bold")).pack(fill=tk.X, pady=(6, 0))
+        column.addSpacing(6)
+        column.addWidget(section_label("SUGGESTED QUESTIONS"))
         questions = [
             "Why is this entity important?",
             "What anomalies involve this entity?",
@@ -3530,32 +4358,38 @@ class CriminalNetworkAnalyst:
             "Who should I investigate next?",
             "What evidence contradicts this hypothesis?",
         ]
-        qbox = tk.Frame(self.ai_tab, bg="#d9d9d9")
-        qbox.pack(fill=tk.X, padx=5, pady=3)
+        qbox = QWidget()
+        qbox_layout = vbox(qbox, spacing=3)
         for q in questions:
-            tk.Button(qbox, text=q, anchor="w", relief=tk.GROOVE,
-                      command=lambda text=q: self._ask_question(text)).pack(fill=tk.X, pady=1)
+            qbox_layout.addWidget(
+                make_button(q, lambda text=q: self._ask_question(text)))
+        column.addWidget(qbox)
 
-        # Bottom widgets are packed first so they are never pushed off-screen.
-        self.ai_activity_var = tk.StringVar(value="AI ACTIVITY: ready")
-        tk.Label(self.ai_tab, textvariable=self.ai_activity_var, bg="#d9d9d9", fg="#555555",
-                 anchor="w", font=("Arial", 8)).pack(side=tk.BOTTOM, fill=tk.X, padx=5, pady=(0, 4))
-
-        input_row = tk.Frame(self.ai_tab, bg="#d9d9d9")
-        input_row.pack(side=tk.BOTTOM, fill=tk.X, padx=5, pady=(0, 2))
-        self.ai_input = tk.Entry(input_row)
-        self.ai_input.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        self.ai_input.bind("<Return>", lambda _e: self.ask_ai())
-        tk.Button(input_row, text="✦ ASK AI", bg="#66cccc", command=self.ask_ai).pack(side=tk.RIGHT, padx=(4, 0))
-
-        tk.Label(self.ai_tab, text="✦ AI RESPONSE", bg="#404040", fg="white",
-                 font=("Arial", 9, "bold")).pack(fill=tk.X, pady=(4, 0))
-        self.ai_chat = tk.Text(self.ai_tab, height=8, wrap="word", bg="white", fg="black", relief=tk.SUNKEN,
-                               bd=1, font=("Arial", 9))
-        self.ai_chat.pack(fill=tk.BOTH, expand=True, padx=5, pady=4)
+        column.addSpacing(6)
+        column.addWidget(section_label("AI RESPONSE"))
+        self.ai_chat = TextBox()
+        column.addWidget(self.ai_chat, 1)
         self.ai_chat.insert("1.0", "AI Copilot ready. Select an entity or ask a question.\n\n"
                                    "This assistant queries the live graph and FIR evidence only when needed.\n")
         self.ai_chat.configure(state="disabled")
+
+        input_row = QWidget()
+        input_layout = hbox(input_row, spacing=6)
+        self.ai_input = EntryBox()
+        self.ai_input.setPlaceholderText("Ask about the selected entity…")
+        self.ai_input.returnPressed.connect(self.ask_ai)
+        input_layout.addWidget(self.ai_input, 1)
+        ask_button = make_button("Ask AI", self.ask_ai, object_name="primary")
+        ask_button.setFixedWidth(84)
+        input_layout.addWidget(ask_button)
+        column.addWidget(input_row)
+
+        self.ai_activity_var = Var("AI ACTIVITY: ready")
+        activity_label = QLabel()
+        activity_label.setObjectName("activity")
+        activity_label.setWordWrap(True)
+        self.ai_activity_var.bind_label(activity_label)
+        column.addWidget(activity_label)
 
     def _render_ai_agents(self, running=None):
         running = running or set()
@@ -3784,14 +4618,18 @@ class CriminalNetworkAnalyst:
         if self.selected_node not in self.G:
             return messagebox.showwarning("Evidence", "Select an entity first.")
         evidence = self._collect_entity_evidence(self.selected_node)
-        win = tk.Toplevel(self.root)
-        win.title("Evidence References")
-        win.geometry("650x500")
-        tk.Label(win, text="EVIDENCE REFERENCES", bg="#404040", fg="white", font=("Arial", 11, "bold")).pack(fill=tk.X)
-        txt = tk.Text(win, wrap="word")
-        txt.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        win = QDialog(self.root)
+        win.setWindowTitle("Evidence References")
+        win.resize(660, 520)
+        win.setWindowFlag(Qt.WindowMinMaxButtonsHint, True)
+        column = vbox(win, margins=(14, 12, 14, 14), spacing=8)
+        column.addWidget(section_label("EVIDENCE REFERENCES"))
+        txt = TextBox(mono=True)
+        column.addWidget(txt, 1)
         txt.insert("1.0", json.dumps(evidence, indent=2, default=str))
         txt.configure(state="disabled")
+        self._evidence_window = win
+        win.show()
 
     def ai_challenge(self):
         if self.selected_node not in self.G:
@@ -3848,43 +4686,68 @@ class CriminalNetworkAnalyst:
         if not pending:
             return decisions
 
-        dialog = tk.Toplevel(self.root)
-        dialog.title("FIR Entity Review Queue")
-        dialog.geometry("900x560")
-        dialog.transient(self.root)
-        dialog.grab_set()
+        dialog = QDialog(self.root)
+        dialog.setWindowTitle("FIR Entity Review Queue")
+        dialog.resize(900, 560)
+        dialog.setModal(True)
+        column = vbox(dialog, margins=(16, 14, 16, 14), spacing=8)
 
-        ttk.Label(dialog, text="Review FIR entity matches", font=("Segoe UI", 12, "bold")).pack(anchor="w", padx=12, pady=(12, 4))
-        ttk.Label(dialog, text="Merge uses the suggested existing node. Create New adds a separate graph entity.", wraplength=850).pack(anchor="w", padx=12, pady=(0, 8))
+        heading = QLabel("Review FIR entity matches")
+        heading.setFont(QFont("Segoe UI", 13, QFont.Bold))
+        column.addWidget(heading)
+        subheading = QLabel(
+            "Merge uses the suggested existing node. Create New adds a separate graph entity.")
+        subheading.setObjectName("hint")
+        subheading.setWordWrap(True)
+        column.addWidget(subheading)
 
-        outer = ttk.Frame(dialog)
-        outer.pack(fill="both", expand=True, padx=12, pady=8)
-        canvas = tk.Canvas(outer, bg="#f0f0f0", highlightthickness=0)
-        scrollbar = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
-        inner = ttk.Frame(canvas)
-        inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.create_window((0, 0), window=inner, anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar.set)
-        canvas.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        inner = QWidget()
+        inner_column = vbox(inner, margins=(2, 2, 10, 2), spacing=8)
+        scroll.setWidget(inner)
+        column.addWidget(scroll, 1)
 
         choices = {}
-        for row, item in enumerate(pending):
-            choice = tk.StringVar(value="create")
-            choices[item["index"]] = choice
-            frame = tk.Frame(inner, bg="#d9d9d9", bd=1, relief="solid")
-            frame.grid(row=row, column=0, sticky="ew", padx=2, pady=4)
-            inner.columnconfigure(0, weight=1)
+        for item in pending:
+            card = QFrame()
+            card.setObjectName("panel")
+            card.setStyleSheet(
+                f"QFrame#panel {{ background: {C_PANEL_HI}; border: 1px solid {C_LINE};"
+                f" border-radius: 6px; }}")
+            card_column = vbox(card, margins=(12, 10, 12, 10), spacing=4)
+
+            title = QLabel(f"{item['value']}  [{item['type']}]")
+            title.setFont(QFont("Segoe UI", 10, QFont.Bold))
+            card_column.addWidget(title)
+
             ambiguous_text = "AMBIGUOUS" if item["ambiguous"] else "FUZZY MATCH"
-            tk.Label(frame, text=f"{item['value']}  [{item['type']}]", bg="#d9d9d9", font=("Segoe UI", 10, "bold"), anchor="w").grid(row=0, column=0, sticky="ew", padx=8, pady=(7, 2))
-            tk.Label(frame, text=f"{ambiguous_text} · similarity {item['score']}% · candidate: {item['candidate_label']}", bg="#d9d9d9", fg="#555555", anchor="w").grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 5))
-            merge_state = "normal" if item["candidate"] in self.G.nodes else "disabled"
-            tk.Radiobutton(frame, text="Merge with candidate", variable=choice, value="merge", state=merge_state, bg="#d9d9d9", anchor="w").grid(row=2, column=0, sticky="w", padx=8, pady=2)
-            tk.Radiobutton(frame, text="Create New", variable=choice, value="create", bg="#d9d9d9", anchor="w").grid(row=3, column=0, sticky="w", padx=8, pady=(2, 7))
+            detail = QLabel(
+                f"{ambiguous_text} · similarity {item['score']}% · "
+                f"candidate: {item['candidate_label']}")
+            detail.setObjectName("hint")
+            detail.setWordWrap(True)
+            card_column.addWidget(detail)
+
+            merge_radio = QRadioButton("Merge with candidate")
+            create_radio = QRadioButton("Create New")
+            merge_radio.setEnabled(item["candidate"] in self.G.nodes)
+            create_radio.setChecked(True)
+            card_column.addWidget(merge_radio)
+            card_column.addWidget(create_radio)
+
+            choices[item["index"]] = RadioVar("create")
+            choices[item["index"]].bind_radios(
+                {"merge": merge_radio, "create": create_radio})
+            merge_radio.toggled.connect(
+                lambda checked, v=choices[item["index"]]: v.set("merge") if checked else None)
+            create_radio.toggled.connect(
+                lambda checked, v=choices[item["index"]]: v.set("create") if checked else None)
+
+            inner_column.addWidget(card)
+        inner_column.addStretch(1)
 
         result = {"confirmed": False}
-        buttons = ttk.Frame(dialog)
-        buttons.pack(fill="x", padx=12, pady=10)
 
         def approve():
             for item in pending:
@@ -3894,15 +4757,20 @@ class CriminalNetworkAnalyst:
                 else:
                     decisions[item["index"]] = {"action": "create", "node_id": None, "score": item["score"]}
             result["confirmed"] = True
-            dialog.destroy()
+            dialog.accept()
 
         def cancel():
             result["confirmed"] = False
-            dialog.destroy()
+            dialog.reject()
 
-        ttk.Button(buttons, text="Approve & Continue", command=approve).pack(side="right", padx=(6, 0))
-        ttk.Button(buttons, text="Cancel FIR import", command=cancel).pack(side="right")
-        self.root.wait_window(dialog)
+        buttons = QWidget()
+        button_row = hbox(buttons, spacing=8)
+        button_row.addStretch(1)
+        button_row.addWidget(make_button("Cancel FIR import", cancel, object_name="quiet"))
+        button_row.addWidget(make_button("Approve & Continue", approve, object_name="primary"))
+        column.addWidget(buttons)
+
+        dialog.exec()
         if not result["confirmed"]:
             raise RuntimeError("FIR import cancelled during entity review.")
         return decisions
@@ -4132,15 +5000,24 @@ class CriminalNetworkAnalyst:
         self._ai_activity("FIR processing failed")
 
 
-def _on_close(root, app):
+def _on_close(app):
+    """Release the Neo4j driver when the main window is closed."""
     try:
         app.neo4j.close()
-    finally:
-        root.destroy()
+    except Exception:
+        pass
+
+
+def main():
+    global _GUI_WINDOW
+    qt_app = QApplication.instance() or QApplication(sys.argv)
+    qt_app.setApplicationName("Intelligence Analyst Workbench")
+    root = MainWindow()
+    _GUI_WINDOW = root
+    CriminalNetworkAnalyst(root)
+    root.show()
+    return qt_app.exec()
 
 
 if __name__ == "__main__":
-    root = tk.Tk()
-    app = CriminalNetworkAnalyst(root)
-    root.protocol("WM_DELETE_WINDOW", lambda: _on_close(root, app))
-    root.mainloop()
+    sys.exit(main())
