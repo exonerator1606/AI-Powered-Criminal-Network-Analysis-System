@@ -12,6 +12,8 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
 import os
+import sqlite3
+import difflib
 
 try:
     from google import genai
@@ -423,9 +425,9 @@ FULL_MULTI_AGENT = False
 # Used automatically for the AI Copilot and handwritten-FIR OCR. If left empty,
 # the GEMINI_API_KEY environment variable is used instead.
 GEMINI_API_KEY = ""
-GEMINI_MODEL_DEFAULT = "gemini-3.6-flash"
-GEMINI_MAX_OUTPUT_TOKENS = 8192
-GEMINI_CONTEXT_CHARS = 20000                # max live-graph context sent per request
+GEMINI_MODEL_DEFAULT = "gemini-3.1-flash-lite"
+GEMINI_MAX_OUTPUT_TOKENS = 1800
+GEMINI_CONTEXT_CHARS = 16000                # max live-graph context sent per request
 
 
 def _configured_gemini_key():
@@ -728,6 +730,7 @@ Do not invent missing digits or names. Keep names/identifiers exactly as readabl
             "response_mime_type": "application/json",
             "response_schema": FIRData,
             "temperature": 0.0,
+            "max_output_tokens": 1800,
         }
         if genai_types is not None:
             config = genai_types.GenerateContentConfig(**config)
@@ -786,13 +789,53 @@ Do not invent missing digits or names. Keep names/identifiers exactly as readabl
         }
 
     def extract_fir(self, path):
+        """Offline-first, cached FIR extraction. Cloud only for image-only/scanned FIRs."""
+        import hashlib
+        source=Path(path)
+        fingerprint=hashlib.sha256(source.read_bytes()).hexdigest()
+        cache=source.with_name(source.stem+'_fir_cache_'+fingerprint[:12]+'.json')
+        if cache.exists():
+            try:
+                result=json.loads(cache.read_text(encoding='utf-8'))
+                if result.get('transcription'): return result
+            except (ValueError,OSError): pass
+        if source.suffix.lower() in ('.pdf','.txt'):
+            try:
+                text=self.extract_text(path)
+                if len(text.strip())>=100:
+                    # Registry names in digitally generated FIRs can be found exactly,
+                    # without using any cloud tokens. Use a read-only independent SQLite
+                    # connection because this method runs in a worker thread.
+                    import sqlite3
+                    registry=Path(__file__).with_name('pscypher_town.sqlite3')
+                    names=[]
+                    if registry.exists():
+                        conn=sqlite3.connect(str(registry))
+                        try:
+                            names=[r[0] for r in conn.execute('SELECT name FROM citizens')]
+                        finally: conn.close()
+                    found=[]
+                    for name in sorted(set(names),key=len,reverse=True):
+                        if re.search(r'(?<![A-Za-z])'+re.escape(name)+r'(?![A-Za-z])',text,re.IGNORECASE):
+                            found.append({'type':'person','value':name,'is_ambiguous':False})
+                    if found:
+                        result={'transcription':text,'entities':found,'relationships':[],
+                                'transcription_path':self._save_transcription(path,text),
+                                'ocr_backend':'OFFLINE_TEXT_AND_REGISTRY','cloud_error':''}
+                        cache.write_text(json.dumps(result),encoding='utf-8')
+                        return result
+            except Exception: pass
         try:
-            return self.cloud_extract(path)
+            result=self.cloud_extract(path)
+            cache.write_text(json.dumps(result),encoding='utf-8')
+            return result
         except Exception as exc:
             # Cloud failure is intentionally non-fatal: immediately use the existing
             # local OCR path so a demo laptop can continue without network access.
             try:
-                return self._fallback_result(path, exc)
+                result=self._fallback_result(path, exc)
+                cache.write_text(json.dumps(result),encoding='utf-8')
+                return result
             except Exception as fallback_exc:
                 raise RuntimeError(
                     "Gemini OCR failed and local OCR fallback also failed.\n"
@@ -1265,10 +1308,92 @@ traits that are not explicitly present.""",
         return ("\n\nRecommended fix: set a valid GEMINI_API_KEY at the top of the AI section "
                 "in the code (or as an environment variable) and restart.")
 
-    def _context_text(self, node_id=None):
-        context = self.tools.tool_context(node_id)
-        raw = json.dumps(context, indent=2, default=str)
-        return raw[:GEMINI_CONTEXT_CHARS]
+    def _relevant_firs(self, node_id=None, question=""):
+        """Send bounded actual FIR excerpts, prioritizing the investigated person."""
+        G = self.app.G
+        name = str(G.nodes[node_id].get("label", node_id)) if node_id in G else ""
+        docs = []
+        for doc in self.app.evidence_store.fir_documents:
+            raw = str(doc.get("text", ""))
+            mentioned = name and name.lower() in raw.lower()
+            score = 2 if mentioned else 0
+            if question and any(w.lower() in raw.lower() for w in re.findall(r"[A-Za-z]{5,}", question)[:8]):
+                score += 1
+            docs.append((score, doc, raw))
+        docs.sort(key=lambda row: -row[0])
+        result = []
+        for _, doc, raw in docs[:5]:
+            excerpt = raw[:1800]
+            if name and name.lower() in raw.lower() and len(raw) > 1800:
+                at = raw.lower().find(name.lower())
+                start = max(0, at - 450)
+                excerpt = raw[start:start + 1800]
+            result.append({"id": doc.get("id"), "file": Path(doc.get("file", "")).name,
+                           "extracted_entities": doc.get("entities", [])[:15],
+                           "source_text_excerpt": excerpt,
+                           "excerpt_only": len(raw) > len(excerpt)})
+        return result
+
+    def _context_text(self, node_id=None, question=""):
+        """Evidence-first, ranked network summary plus question-relevant entities."""
+        G = self.app.G
+        if not G.number_of_nodes():
+            return json.dumps({"message": "No entities imported yet."})
+        ranked = sorted(G.nodes(), key=lambda n: (
+            -G.degree(n), -float(G.nodes[n].get("centrality", 0) or 0), str(n)))
+        question_lower = str(question or "").lower()
+        mentioned = [n for n in G if (len(str(n)) >= 3 and str(n).lower() in question_lower)
+                     or (len(str(G.nodes[n].get("label", n))) >= 3
+                         and str(G.nodes[n].get("label", n)).lower() in question_lower)]
+        focus = list(dict.fromkeys(([node_id] if node_id in G else []) + mentioned + ranked[:18]))[:25]
+        H = self.app._analysis_graph()
+        communities = {}
+        for n in G:
+            c = G.nodes[n].get("community")
+            if c is not None:
+                communities.setdefault(str(c), []).append(str(G.nodes[n].get("label", n)))
+        context = {
+            "scope": "CURRENT IMPORTED GRAPH; records are observations, not proof of wrongdoing",
+            "question": question,
+            "nodes": G.number_of_nodes(), "distinct_relation_edges": G.number_of_edges(),
+            "source_observations": sum(len(d.get("records", [])) for _, _, d in G.edges(data=True)),
+            "relation_types": sorted(set(str(d.get("label", "Linked to")) for _, _, d in G.edges(data=True))),
+            "connected_components": nx.number_connected_components(H) if H.number_of_nodes() else 0,
+            "communities": {k: v[:20] for k, v in list(communities.items())[:12]},
+            "fir_documents": self._relevant_firs(node_id, question),
+            "entities_ranked_by_unique_links": []
+        }
+        for n in focus:
+            d = G.nodes[n]
+            neighbors = []
+            for nbr in sorted(G.neighbors(n), key=lambda v: (-len(G[n][v]), -G.degree(v), str(v)))[:16]:
+                rels = []
+                for ed in G[n][nbr].values():
+                    records = ed.get("records", [])
+                    rels.append({
+                        "type": ed.get("label", "Linked to"), "observation_count": ed.get("count", len(records) or 1),
+                        "evidence": [{"source": r.get("_source_file", r.get("source_file", "unknown")),
+                                      "row": r.get("_row"),
+                                      "values": {k: v for k, v in r.items() if not str(k).startswith("_")}}
+                                     for r in records[:4]]
+                    })
+                neighbors.append({"id": str(nbr), "name": G.nodes[nbr].get("label", str(nbr)),
+                                  "relationships": rels})
+            context["entities_ranked_by_unique_links"].append({
+                "id": str(n), "name": d.get("label", str(n)), "type": d.get("type", "Entity"),
+                "properties": d.get("properties", {}), "unique_neighbors": len(list(G.neighbors(n))),
+                "total_relationship_edges": G.degree(n), "community": d.get("community"),
+                "betweenness": round(float(d.get("betweenness_centrality", 0) or 0), 5),
+                "evidence_association_score_NOT_guilt": round(self.app.calculate_evidence_score(n)["score"], 1),
+                "anomalies": self.app._anomaly_results.get(str(n), [])[:4],
+                "fir_mentions": self.app._collect_entity_evidence(n).get("fir_mentions", [])[:8],
+                "neighbors": neighbors})
+        raw = json.dumps(context, ensure_ascii=False, default=str)
+        # Preserve valid JSON and never truncate mid-record.
+        while len(raw) > GEMINI_CONTEXT_CHARS and len(context["entities_ranked_by_unique_links"]) > 1:
+            context["entities_ranked_by_unique_links"].pop()
+            raw = json.dumps(context, ensure_ascii=False, default=str)
+        return raw
 
     def chat(self, question, node_id=None):
         self.refresh_backend()
@@ -1276,14 +1401,25 @@ traits that are not explicitly present.""",
         if not status:
             raise RuntimeError(detail + self._unavailable_hint())
         prompt = (
-            f"QUESTION:\n{question}\n\n"
-            "LIVE INVESTIGATION CONTEXT:\n"
-            f"{self._context_text(node_id)}\n\n"
-            "Answer concisely (prefer <= 180 words). Cite source filenames/rows when present. "
-            "Do not restate the whole context."
+            f"INVESTIGATOR QUESTION: {question}\n\n"
+            f"LIVE GRAPH EVIDENCE (JSON):\n{self._context_text(node_id, question)}\n\n"
+            "Give a concrete investigative answer, not generic advice. "
+            "Name 3-6 relevant entities whenever evidence permits; explain why each matters, "
+            "quote observed connection counts, label relationship types and identify exact CSV filenames/rows "
+            "where provided. Compare central hubs with brokers and peripheral nodes. "
+            "If asked about a possible trafficking ring, explain which patterns are consistent with the "
+            "hypothesis AND what alternative explanations remain; never assert trafficking is established. "
+            "For each important claim distinguish OBSERVED vs HYPOTHESIS. "
+            "Finish with 2-4 specific verification actions involving named nodes or records. "
+            "If evidence does not support an answer, explicitly say what is missing. "
+            "Use FIR source_text_excerpt to distinguish a person's mention, role (victim, witness, suspect), "
+            "incident dates and narrative details from CDR/financial observations; cite exact FIR filename. "
+            "If no FIR implicates the selected entity, state that explicitly. "
+            "Do not invent timestamps, amounts, FIR content or names. "
+            "Use simple plain-text headings and numbered statements; avoid Markdown symbols (#, **, backticks). "
+            "Aim for 250-450 words if data warrants detail."
         )
-        answer = self.backend.generate(self.BASE_RULES, prompt, temperature=0.15)
-        return answer
+        return self.backend.generate(self.BASE_RULES, prompt, temperature=0.1)
 
     def deep_analysis(self, node_id):
         """Run either an efficient one-pass multi-perspective analysis or the full
@@ -1293,22 +1429,30 @@ traits that are not explicitly present.""",
         status, detail = self.backend.available()
         if not status:
             raise RuntimeError(detail + self._unavailable_hint())
-        context = self._context_text(node_id)
+        context = self._context_text(node_id, "Explain this entity with specific evidence")
         deterministic = self.app.calculate_evidence_score(node_id)
 
         if not FULL_MULTI_AGENT:
             self.app._ai_activity("Three specialist roles are analyzing the selected entity in one inference...")
             fast_system = self.BASE_RULES + """
-You are a multi-perspective investigation analyst. In ONE response, simulate three
-specialist perspectives and then an Evidence Evaluator. Keep each specialist section
-short. Use ONLY the supplied evidence. Required headings:
-1) LLM 1 — Criminology Specialist
-2) LLM 2 — Temporal Pattern Expert
-3) LLM 3 — Demographic / Context Analyst
-4) ◆ Evidence Evaluator
-For the evaluator, include: score interpretation, supporting evidence, evidence
-against/limitations, anomaly interpretation, and next questions. Do not change the
-deterministic score. Never claim guilt.
+Create a compact investigation briefing for the SELECTED entity. Act as three
+internal perspectives (network criminology, temporal patterns, context) and one
+Evidence Evaluator, but output their combined gist rather than verbose sections.
+Return ONLY a valid JSON object (no markdown/code fences) with keys:
+"gist": string, 2-3 concise sentences combining the three perspectives,
+  cite the specific FIR and describe the selected person's stated role in it when applicable;
+  then correlate with named linked entities and observed CDR/financial records;
+"hypothesis": string, 1-2 sentences clearly qualified as UNCONFIRMED and
+  supported by FIR narrative AND interaction evidence if both are available;
+"alternative": string, one sentence on alternative explanation or missing proof;
+"next_questions": array of 2-3 short, specific investigator questions grounded in
+  the named nodes, records or missing evidence (each should be actionable).
+Do not repeat numerical score components: they are displayed deterministically by the UI.
+Do not claim a person committed a crime or treat graph centrality as guilt.
+Do not invent chronology from timestamps not in the context.
+Do not claim that a FIR mention itself implicates a person; recognize victim/witness roles.
+If FIRs are missing or unrelated, explicitly say so rather than implying corroboration.
+Keep total text in these fields under 160 words.
 """
             prompt = (
                 f"DETERMINISTIC EVIDENCE ASSOCIATION SCORE: {deterministic['score']:.0f}/100\n"
@@ -1334,11 +1478,13 @@ deterministic score. Never claim guilt.
             self.app._ai_activity(f"{name} ✓")
 
         evaluator_system = self.BASE_RULES + """
-You are the Evidence Evaluator. Synthesize three specialist analyses. Return a concise
-investigator briefing with: Evidence Association Score (0-100, not a guilt probability),
-key supporting evidence, evidence against/limitations, important anomalies, and next
-investigative questions. Do not manufacture numeric evidence. The displayed score must
-come from the supplied deterministic score; explain it rather than replacing it.
+Synthesize the three internal perspectives in the same concise JSON format:
+{"gist":"2-3 sentences of specific grounded network/temporal/contextual observations",
+ "hypothesis":"1-2 sentences, unconfirmed evidence-evaluator hypothesis",
+ "alternative":"one sentence limiting interpretation or alternative explanation",
+ "next_questions":["specific question 1","specific question 2"]}
+Output valid JSON only; no markdown or extra prose. Under 160 words total.
+Keep deterministic score unchanged and do not infer guilt.
 """
         evaluator_prompt = (
             f"DETERMINISTIC EVIDENCE ASSOCIATION SCORE: {deterministic['score']:.0f}/100\n"
@@ -1529,13 +1675,129 @@ class Neo4jSync:
 
 
 # ============================================================================
+# PERSISTENT SYNTHETIC TOWN REGISTRY (independent from case graph)
+# ============================================================================
+class TownRegistry:
+    """SQLite town identities and pre-existing social relationships.
+
+    This registry is NOT the investigation graph. The case graph only receives
+    people actually matched in FIRs (and requested first-degree contacts).
+    """
+    def __init__(self, path):
+        self.path = str(path)
+        self.conn = sqlite3.connect(self.path)
+        self.conn.row_factory = sqlite3.Row
+        self.conn.execute("CREATE TABLE IF NOT EXISTS citizens (id TEXT PRIMARY KEY, name TEXT NOT NULL, phone TEXT UNIQUE, address TEXT, details TEXT NOT NULL DEFAULT '{}')")
+        self.conn.execute("CREATE INDEX IF NOT EXISTS citizen_name_idx ON citizens(name COLLATE NOCASE)")
+        self.conn.execute("CREATE TABLE IF NOT EXISTS ties (a TEXT NOT NULL, b TEXT NOT NULL, relation TEXT NOT NULL, PRIMARY KEY(a,b,relation))")
+        self.conn.commit()
+
+    def count(self):
+        return self.conn.execute("SELECT COUNT(*) FROM citizens").fetchone()[0]
+
+    def seed_demo(self, number=10000):
+        """Generate explicitly fictional people and social ties; never real IDs."""
+        if self.count():
+            return self.count()
+        first = ('Aarav','Ishaan','Vihaan','Rohan','Aditya','Ananya','Diya','Priya','Kabir','Meera',
+                 'Arjun','Nisha','Dev','Kavya','Neha','Sahil','Rahul','Sanya','Ira','Vikram',
+                 'Aditi','Tanvi','Manav','Riya','Abhay','Anika','Om','Tara','Naman','Pooja')
+        last = ('Sharma','Iyer','Patel','Singh','Gupta','Verma','Mehta','Khan','Rao','Joshi',
+                'Nair','Das','Mishra','Saxena','Bose','Chauhan','Yadav','Dubey','Soni','Jain')
+        with self.conn:
+            for i in range(1,number+1):
+                # Suffix distinguishes duplicate/common names, not used for entity matching.
+                name=f'{first[(i-1)%len(first)]} {last[((i-1)//len(first))%len(last)]}'
+                self.conn.execute('INSERT INTO citizens(id,name,phone,address,details) VALUES(?,?,?,?,?)',
+                    (f'T{i:05d}',name,f'7000{i:06d}',f'Ward {1+(i%25)}, Nandipur (fictional)',
+                    json.dumps({'source':'SYNTHETIC_DEMO','ward':1+(i%25)})))
+                if i > 1:
+                    a,b=sorted((f'T{i:05d}',f'T{i-1:05d}'))
+                    self.conn.execute('INSERT OR IGNORE INTO ties VALUES(?,?,?)',(a,b,'Known neighbor'))
+                if i > 5 and i % 4 == 0:
+                    a,b=sorted((f'T{i:05d}',f'T{i-5:05d}'))
+                    self.conn.execute('INSERT OR IGNORE INTO ties VALUES(?,?,?)',(a,b,'Known acquaintance'))
+        return self.count()
+
+    def import_citizens(self,path):
+        count=0
+        with open(path,encoding='utf-8-sig',newline='') as f, self.conn:
+            for row in csv.DictReader(f):
+                lower={k.lower().strip():str(v or '').strip() for k,v in row.items() if k}
+                cid=lower.get('id') or lower.get('person_id') or lower.get('citizen_id') or f'T{count+1:05d}'
+                name=lower.get('name') or lower.get('full_name')
+                if not cid or not name: continue
+                phone=lower.get('phone') or lower.get('phone_number') or None
+                self.conn.execute('INSERT OR REPLACE INTO citizens(id,name,phone,address,details) VALUES(?,?,?,?,?)',
+                    (cid,name,phone,lower.get('address',''),json.dumps(row,default=str)))
+                count+=1
+        return count
+
+    def import_ties(self,path):
+        count=0
+        with open(path,encoding='utf-8-sig',newline='') as f, self.conn:
+            for row in csv.DictReader(f):
+                lower={k.lower().strip():str(v or '').strip() for k,v in row.items() if k}
+                a=lower.get('source') or lower.get('from') or lower.get('person_a')
+                b=lower.get('target') or lower.get('to') or lower.get('person_b')
+                if not a or not b or a==b: continue
+                # Optional ties file may use names instead of internal IDs.
+                def town_key(value):
+                    if self.get(value): return value
+                    options=self.conn.execute('SELECT id FROM citizens WHERE name=? COLLATE NOCASE LIMIT 2',(value,)).fetchall()
+                    return options[0]['id'] if len(options)==1 else None
+                a,b=town_key(a),town_key(b)
+                if not a or not b or a==b: continue
+                a,b=sorted((a,b))
+                if self.conn.execute('SELECT 1 FROM citizens WHERE id=?',(a,)).fetchone() and self.conn.execute('SELECT 1 FROM citizens WHERE id=?',(b,)).fetchone():
+                    self.conn.execute('INSERT OR IGNORE INTO ties VALUES(?,?,?)',(a,b,lower.get('relation') or 'Known association'))
+                    count+=1
+        return count
+
+    def candidates(self,value,etype='person'):
+        """Use identifier equality where possible; names require human review.
+        Phone exact-match is treated as a lead, not proof of identity.
+        """
+        value=str(value or '').strip()
+        if not value: return []
+        # Phone/vehicle/account mentions become their own evidence nodes, never a
+        # citizen solely because a number happens to equal a stored contact field.
+        if etype.lower() not in ('person','suspect','entity'):
+            return []
+        direct=self.conn.execute('SELECT * FROM citizens WHERE id=? OR phone=?',(value,value)).fetchall()
+        if direct:
+            return [(dict(row),100) for row in direct]
+        if etype.lower() not in ('person','suspect','entity'):
+            return []
+        exact=self.conn.execute('SELECT * FROM citizens WHERE name=? COLLATE NOCASE LIMIT 12',(value,)).fetchall()
+        if exact:
+            return [(dict(row),100) for row in exact]
+        # Name prefix narrows potential matches; avoid scanning 10K with fuzzy on every FIR.
+        token=value.split()[0]
+        possible=self.conn.execute('SELECT * FROM citizens WHERE name LIKE ? LIMIT 80',(token[:3]+'%',)).fetchall()
+        scored=[(dict(row),round(100*difflib.SequenceMatcher(None,value.casefold(),row['name'].casefold()).ratio())) for row in possible]
+        return sorted([x for x in scored if x[1]>=76],key=lambda x:-x[1])[:8]
+
+    def get(self, citizen_id):
+        row=self.conn.execute('SELECT * FROM citizens WHERE id=?',(citizen_id,)).fetchone()
+        return dict(row) if row else None
+
+    def neighbors(self,citizen_id,limit=12):
+        rows=self.conn.execute('SELECT a,b,relation FROM ties WHERE a=? OR b=? LIMIT ?', (citizen_id,citizen_id,limit)).fetchall()
+        return [(r['b'] if r['a']==citizen_id else r['a'],r['relation']) for r in rows]
+
+    def close(self):
+        self.conn.close()
+
+
+# ============================================================================
 #  WORKBENCH GUI
 # ============================================================================
 
 class CriminalNetworkAnalyst:
     def __init__(self, root):
         self.root = root
-        self.root.title("Intelligence Analyst Workbench - SIH 2024 (Neo4j-backed, Spread + Multi-CSV)")
+        self.root.title("Intelligence Analyst Workbench - SIH 2026 (Neo4j-backed, Spread + Multi-CSV)")
         self.root.geometry("1400x850")
         self.root.configure(bg="#f0f0f0")
 
@@ -1546,6 +1808,7 @@ class CriminalNetworkAnalyst:
         # Neo4j mirror: every add/delete below is pushed here (when connected)
         # so the investigation graph is durably stored and Cypher-queryable.
         self.neo4j = Neo4jSync()
+        self.town = TownRegistry(Path(__file__).with_name("pscypher_town.sqlite3"))
 
         # AI / Evidence state -- AI work is optional and runs through the Gemini API.
         self.evidence_store = EvidenceStore()
@@ -1572,6 +1835,9 @@ class CriminalNetworkAnalyst:
         self.selected_node = None
         self.selected_edge = None
         self.node_positions = {}
+        self.graph_zoom = tk.DoubleVar(value=1.0)
+        self.focus_count = tk.IntVar(value=20)  # 0 means all nodes
+        self._focus_positions = {}
         self.dragging_node = None
         self.mode = "select"             # "select" | "link" | "path"
         self.pending_first_node = None   # first node picked in link/path mode
@@ -1613,6 +1879,13 @@ class CriminalNetworkAnalyst:
         file_menu.add_command(label="Clear Investigation", command=self.clear_investigation)
         menubar.add_cascade(label="File", menu=file_menu)
 
+        town_menu = tk.Menu(menubar, tearoff=0)
+        town_menu.add_command(label="Initialize Synthetic Town (10,000)", command=self.initialize_town)
+        town_menu.add_command(label="Import Town Citizens (CSV)", command=self.import_town_citizens)
+        town_menu.add_command(label="Import Town Relationships (CSV)", command=self.import_town_ties)
+        town_menu.add_command(label="Town Database Status", command=lambda: messagebox.showinfo("Town Registry",f"{self.town.count():,} citizens stored persistently.\nDatabase: {self.town.path}"))
+        menubar.add_cascade(label="Town Database", menu=town_menu)
+
         # NEO4J MENU
         neo4j_menu = tk.Menu(menubar, tearoff=0)
         neo4j_menu.add_command(label="Connect to Neo4j...", command=self.neo4j_connect_dialog)
@@ -1639,6 +1912,11 @@ class CriminalNetworkAnalyst:
 
         # VIEW MENU
         view_menu = tk.Menu(menubar, tearoff=0)
+        view_menu.add_command(label="Show Entire Graph", command=lambda: self.set_graph_focus(0))
+        view_menu.add_command(label="Focus Top 10 Nodes", command=lambda: self.set_graph_focus(10))
+        view_menu.add_command(label="Focus Top 20 Nodes", command=lambda: self.set_graph_focus(20))
+        view_menu.add_command(label="Focus Top 40 Nodes", command=lambda: self.set_graph_focus(40))
+        view_menu.add_separator()
         view_menu.add_command(label="Auto Layout", command=self.auto_layout)
         view_menu.add_separator()
         view_menu.add_command(label="Spread Layout", command=self.auto_layout)
@@ -1669,17 +1947,8 @@ class CriminalNetworkAnalyst:
                              command=lambda n=name: self.add_new_entity_at_center(n))
             btn.pack(fill=tk.X, padx=10, pady=3)
 
-        tk.Label(self.left_panel, text="MODE", bg="#404040", fg="white",
-                 font=("Arial", 10, "bold")).pack(fill=tk.X, pady=(15, 0))
-
-        self.mode_var = tk.StringVar(value="select")
-        tk.Radiobutton(self.left_panel, text="Select / Drag", variable=self.mode_var, value="select",
-                       command=lambda: self.set_mode("select"), bg="#d9d9d9", anchor="w").pack(fill=tk.X, padx=10)
-        tk.Radiobutton(self.left_panel, text="Create Link", variable=self.mode_var, value="link",
-                       command=lambda: self.set_mode("link"), bg="#d9d9d9", anchor="w").pack(fill=tk.X, padx=10)
-
         tk.Label(self.left_panel, text="FIND ENTITY", bg="#404040", fg="white",
-                 font=("Arial", 10, "bold")).pack(fill=tk.X, pady=(15, 0))
+                 font=("Arial", 10, "bold")).pack(fill=tk.X, pady=(9, 0))
         self.search_var = tk.StringVar()
         search_entry = tk.Entry(self.left_panel, textvariable=self.search_var)
         search_entry.pack(fill=tk.X, padx=10, pady=5)
@@ -1688,34 +1957,40 @@ class CriminalNetworkAnalyst:
             fill=tk.X, padx=10)
 
         tk.Label(self.left_panel, text="DATA IN", bg="#404040", fg="white",
-                 font=("Arial", 10, "bold")).pack(fill=tk.X, pady=(15, 0))
+                 font=("Arial", 10, "bold")).pack(fill=tk.X, pady=(9, 0))
         tk.Button(self.left_panel, text="Import Relationships (CSV)",
                   command=self.import_relationships_csv).pack(fill=tk.X, padx=10, pady=(5, 2))
         tk.Button(self.left_panel, text="Import Entities (CSV)",
                   command=self.import_entities_csv).pack(fill=tk.X, padx=10, pady=2)
+        tk.Button(self.left_panel, text="Upload Handwritten FIR",
+                  bg="#66cccc", command=self.upload_fir).pack(fill=tk.X, padx=10, pady=2)
+
+        tk.Label(self.left_panel, text="MODE", bg="#404040", fg="white",
+                 font=("Arial", 10, "bold")).pack(fill=tk.X, pady=(9, 0))
+
+        self.mode_var = tk.StringVar(value="select")
+        tk.Radiobutton(self.left_panel, text="Select / Drag", variable=self.mode_var, value="select",
+                       command=lambda: self.set_mode("select"), bg="#d9d9d9", anchor="w").pack(fill=tk.X, padx=10)
+        tk.Radiobutton(self.left_panel, text="Create Link", variable=self.mode_var, value="link",
+                       command=lambda: self.set_mode("link"), bg="#d9d9d9", anchor="w").pack(fill=tk.X, padx=10)
 
         tk.Label(self.left_panel, text="LINK PREDICTION", bg="#404040", fg="white",
-                 font=("Arial", 10, "bold")).pack(fill=tk.X, pady=(15, 0))
+                 font=("Arial", 10, "bold")).pack(fill=tk.X, pady=(9, 0))
         tk.Button(self.left_panel, text="Run Link Prediction", bg="#66cccc",
-                  command=self.run_link_prediction).pack(fill=tk.X, padx=10, pady=5)
-        # Separate controls so Inspector and AI Copilot can be shown/hidden independently.
+                  command=self.run_link_prediction).pack(fill=tk.X, padx=10, pady=4)
+
+        # Independent section for visibility controls; never mix with DATA IN.
+        tk.Label(self.left_panel, text="PANEL VISIBILITY", bg="#404040", fg="white",
+                 font=("Arial", 10, "bold")).pack(fill=tk.X, pady=(9, 0))
         self.inspector_visible = True
         self.ai_panel_visible = True
-
         self.toggle_inspector_btn = tk.Button(
-            self.left_panel,
-            text="Hide Inspector",
-            command=self.toggle_inspector,
-            bg="#bbbbbb"
-        )
-        self.toggle_inspector_btn.pack(fill=tk.X, padx=10, pady=(8, 2))
-
+            self.left_panel, text="Hide Inspector", command=self.toggle_inspector,
+            bg="#bbbbbb")
+        self.toggle_inspector_btn.pack(fill=tk.X, padx=10, pady=(5, 2))
         self.toggle_ai_btn = tk.Button(
-            self.left_panel,
-            text="Hide AI Copilot",
-            command=self.toggle_ai_copilot,
-            bg="#bbbbbb"
-        )
+            self.left_panel, text="Hide AI Copilot", command=self.toggle_ai_copilot,
+            bg="#bbbbbb")
         self.toggle_ai_btn.pack(fill=tk.X, padx=10, pady=(2, 5))
 
         # --- RIGHT PANEL: AI Copilot (vertical) ---
@@ -1733,6 +2008,7 @@ class CriminalNetworkAnalyst:
         # This keeps AI Copilot vertical on the right while the inspector sits
         # horizontally below the graph.
         center = tk.Frame(self.root)
+        self.center_panel = center
         center.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
         # Keep the inspector shallow so it does not consume much graph height.
@@ -1759,10 +2035,60 @@ class CriminalNetworkAnalyst:
         self.canvas = tk.Canvas(center, bg="white", bd=2, relief=tk.SUNKEN, cursor="cross")
         self.canvas.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
 
+        # Small floating vertical zoom control at the upper-left of the graph.
+        # It is a child widget, not a canvas item, so canvas.delete('all')
+        # won't remove it on redraw.
+        zoom_overlay = tk.Frame(self.canvas, bg="#eef2f5", bd=1, relief=tk.RIDGE)
+        zoom_overlay.place(x=15, y=10, anchor="nw")
+        tk.Label(zoom_overlay, text="ZOOM", font=("Arial", 7, "bold"),
+                 bg="#eef2f5").pack(padx=3, pady=(3, 0))
+        tk.Scale(zoom_overlay, from_=2.5, to=0.35, resolution=0.05,
+                 orient=tk.VERTICAL, showvalue=False, length=104,
+                 width=12, sliderlength=18, variable=self.graph_zoom,
+                 command=lambda _v: self.redraw_canvas(),
+                 bg="#eef2f5", highlightthickness=0, bd=0).pack(padx=3)
+        tk.Button(zoom_overlay, text="1:1", font=("Arial", 7),
+                  command=lambda: self.graph_zoom.set(1.0),
+                  padx=2, pady=0).pack(fill=tk.X, padx=3, pady=(0, 3))
+        self.graph_zoom.trace_add("write", lambda *_: self.redraw_canvas())
+
+        # Compact focus control: visible graph only; full investigation stays intact.
+        focus_bar = tk.Frame(self.canvas, bg="#eef2f5", bd=1, relief=tk.RIDGE)
+        focus_bar.place(relx=1.0, x=-12, y=10, anchor="ne")
+        tk.Label(focus_bar, text="GRAPH FOCUS", bg="#eef2f5", font=("Arial", 7, "bold")).pack(side=tk.LEFT, padx=4)
+        self.focus_menu = ttk.Combobox(focus_bar, width=9, state="readonly",
+                                        values=("Top 10", "Top 20", "Top 40", "All nodes"))
+        self.focus_menu.set("Top 20")
+        self.focus_menu.pack(side=tk.LEFT, padx=3, pady=3)
+        self.focus_menu.bind("<<ComboboxSelected>>", lambda _e: self.set_graph_focus(
+            {"Top 10": 10, "Top 20": 20, "Top 40": 40, "All nodes": 0}[self.focus_menu.get()]))
+
         self.canvas.bind("<ButtonPress-1>", self.on_canvas_click)
         self.canvas.bind("<B1-Motion>", self.on_canvas_drag)
         self.canvas.bind("<ButtonRelease-1>", self.on_canvas_release)
         self.canvas.bind("<Button-3>", self.on_canvas_right_click)
+        # Scroll on the graph to zoom; works with Windows/macOS and Linux.
+        # Bind only to the graph canvas, so other panels retain normal scrolling.
+        self.canvas.bind("<MouseWheel>", self.on_graph_mousewheel)
+        self.canvas.bind("<Button-4>", self.on_graph_mousewheel)
+        self.canvas.bind("<Button-5>", self.on_graph_mousewheel)
+
+    def on_graph_mousewheel(self, event):
+        """Zoom the graph using the mouse wheel, synchronized with the slider."""
+        if getattr(event, "num", None) == 4:
+            direction = 1
+        elif getattr(event, "num", None) == 5:
+            direction = -1
+        else:
+            delta = getattr(event, "delta", 0)
+            if not delta:
+                return "break"
+            direction = 1 if delta > 0 else -1
+        current = float(self.graph_zoom.get())
+        new_zoom = round(min(2.5, max(0.35, current + 0.1 * direction)), 2)
+        if new_zoom != current:
+            self.graph_zoom.set(new_zoom)
+        return "break"
 
     # ========================== MODES ==========================
     def toggle_inspector(self):
@@ -1781,11 +2107,11 @@ class CriminalNetworkAnalyst:
     def toggle_ai_copilot(self):
         """Show or hide only the AI Copilot."""
         if self.ai_panel_visible:
-            self.ai_tab.pack_forget()
+            self.right_panel.pack_forget()
             self.ai_panel_visible = False
             self.toggle_ai_btn.config(text="Show AI Copilot")
         else:
-            self.ai_tab.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+            self.right_panel.pack(side=tk.RIGHT, fill=tk.Y, before=self.center_panel)
             self.ai_panel_visible = True
             self.toggle_ai_btn.config(text="Hide AI Copilot")
         self.root.update_idletasks()
@@ -2245,6 +2571,29 @@ class CriminalNetworkAnalyst:
             ]
         return self._relation_colors[relation]
 
+    def set_graph_focus(self, count):
+        """Display-only filter; never removes investigation evidence or graph nodes."""
+        self.focus_count.set(int(count))
+        if hasattr(self, "focus_menu"):
+            self.focus_menu.set({0: "All nodes", 10: "Top 10", 20: "Top 20", 40: "Top 40"}.get(int(count), "All nodes"))
+        self._focus_positions.clear()
+        self.redraw_canvas()
+
+    def _visible_graph_nodes(self):
+        count = self.focus_count.get()
+        if not count or self.G.number_of_nodes() <= count:
+            return set(self.G.nodes)
+        # Degree + betweenness emphasize activity AND bridge entities.
+        H = self._analysis_graph()
+        degrees = dict(H.degree())
+        btw = nx.betweenness_centrality(H, weight=None) if H.number_of_nodes() <= 500 else {}
+        ranked = sorted(H, key=lambda n: (-float(self.G.nodes[n].get("centrality", 0) or 0),
+                                            -btw.get(n, 0), -degrees.get(n, 0), str(n)))
+        keep = set(ranked[:count])
+        if self.selected_node in self.G:
+            keep.add(self.selected_node)
+        return keep
+
     def redraw_canvas(self, highlight_path=None):
         self.canvas.delete("all")
 
@@ -2256,6 +2605,43 @@ class CriminalNetworkAnalyst:
                 fill="#999999", font=("Arial", 12), justify="center")
             return
 
+        visible = self._visible_graph_nodes()
+        focused = len(visible) < self.G.number_of_nodes()
+        # Re-layout only the visible subset, without changing the complete graph.
+        if focused:
+            width, height = max(self.canvas.winfo_width(), 450), max(self.canvas.winfo_height(), 350)
+            if set(self._focus_positions) != visible:
+                # Dense spring layouts pull high-degree hubs into an unreadable knot.
+                # Use concentric *non-overlapping* shells, ordered by centrality.
+                # Focus is purely visual: the complete evidence graph is unchanged.
+                ordered = sorted(visible, key=lambda n: (
+                    -float(self.G.nodes[n].get("centrality", 0) or 0),
+                    -self.G.degree(n), str(n)))
+                cx, cy = width / 2.0, height / 2.0
+                radius = max(110.0, min(width * .44, height * .43))
+                n = len(ordered)
+                if n == 1:
+                    coords = [(cx, cy)]
+                else:
+                    # Largest hubs near the center, with the rest on separated rings.
+                    inner = min(8, max(0, n // 4)) if n > 12 else 0
+                    ring1 = ordered[:inner]
+                    ring2 = ordered[inner:]
+                    coords_by_node = {}
+                    if ring1:
+                        r_inner = radius * .42
+                        for i, nid in enumerate(ring1):
+                            a = 2 * math.pi * i / len(ring1) - math.pi / 2
+                            coords_by_node[nid] = (cx + r_inner * math.cos(a), cy + r_inner * math.sin(a))
+                    for i, nid in enumerate(ring2):
+                        a = 2 * math.pi * (i + .25) / len(ring2) - math.pi / 2
+                        coords_by_node[nid] = (cx + radius * math.cos(a), cy + radius * math.sin(a))
+                    coords = [coords_by_node[nid] for nid in ordered]
+                self._focus_positions = {nid: [float(x), float(y)]
+                                         for nid, (x, y) in zip(ordered, coords)}
+            positions = self._focus_positions
+        else:
+            positions = self.node_positions
         highlight_edges = set()
         if highlight_path:
             for i in range(len(highlight_path) - 1):
@@ -2265,14 +2651,16 @@ class CriminalNetworkAnalyst:
         # observations of the same relation are represented by line thickness.
         pair_edges = {}
         for u, v, key, data in self.G.edges(keys=True, data=True):
+            if u not in visible or v not in visible:
+                continue
             pair = frozenset((u, v))
             pair_edges.setdefault(pair, []).append((u, v, key, data))
 
         for pair, edge_list in pair_edges.items():
             count = len(edge_list)
             for idx, (u, v, key, data) in enumerate(edge_list):
-                x1, y1 = self.node_positions[u]
-                x2, y2 = self.node_positions[v]
+                x1, y1 = positions[u]
+                x2, y2 = positions[v]
 
                 is_path_edge = frozenset((u, v)) in highlight_edges
                 is_selected = self.selected_edge == (u, v, key)
@@ -2322,7 +2710,9 @@ class CriminalNetworkAnalyst:
 
         # Draw small circular nodes last so they remain easy to select.
         for node_id, data in self.G.nodes(data=True):
-            x, y = self.node_positions[node_id]
+            if node_id not in visible:
+                continue
+            x, y = positions[node_id]
             r = self.node_radius(data)
 
             outline = "#e67e22" if node_id == self.selected_node else "#555555"
@@ -2353,6 +2743,12 @@ class CriminalNetworkAnalyst:
                 font=("Arial", font_size, "bold"),
                 tags=(node_id, "entity")
             )
+
+        zoom = float(self.graph_zoom.get())
+        if abs(zoom - 1.0) > 0.001:
+            cx = self.canvas.winfo_width() / 2
+            cy = self.canvas.winfo_height() / 2
+            self.canvas.scale("all", cx, cy, zoom, zoom)
 
     # ========================== INTERACTION ==========================
 
@@ -2440,7 +2836,11 @@ class CriminalNetworkAnalyst:
 
     def on_canvas_drag(self, event):
         if self.mode == "select" and self.dragging_node:
-            self.node_positions[self.dragging_node] = [event.x, event.y]
+            zoom = float(self.graph_zoom.get())
+            cx, cy = self.canvas.winfo_width() / 2, self.canvas.winfo_height() / 2
+            target_positions = (self._focus_positions if self._focus_positions else self.node_positions)
+            target_positions[self.dragging_node] = [cx + (event.x - cx) / zoom,
+                                                    cy + (event.y - cy) / zoom]
             self.redraw_canvas()
 
     def on_canvas_release(self, event):
@@ -3028,37 +3428,34 @@ class CriminalNetworkAnalyst:
         return str(value).strip()
 
     def _find_relationship_endpoint_columns(self, fieldnames, rows):
-        """Find two columns whose values best match existing node IDs.
-
-        No source/target/relation column names are required. Header names are
-        only a weak tie-breaker; the actual decision is based primarily on
-        matching values against graph node IDs.
-        """
+        """Recognize user-specified CDR/financial schemas before legacy inference."""
+        normalized = {str(x).strip().lower():x for x in fieldnames}
+        for a,b in (("calling person","called person"),("sender","recipient"),
+                    ("source","target"),("from","to")):
+            if a in normalized and b in normalized:
+                return normalized[a],normalized[b]
         node_ids = {str(n) for n in self.G.nodes()}
-        if len(fieldnames) < 2 or not node_ids:
-            return None
-
-        scores = []
+        names = {str(d.get('label','')).casefold() for _,d in self.G.nodes(data=True)}
+        ranked=[]
         for col in fieldnames:
-            values = [self._normalise_csv_value(r.get(col, "")) for r in rows]
-            nonempty = [v for v in values if v]
-            if not nonempty:
-                continue
-            matches = sum(v in node_ids for v in nonempty)
-            ratio = matches / len(nonempty)
-            header = col.lower()
-            hint = 0
-            if any(x in header for x in ("source", "from", "origin", "src")):
-                hint += 0.02
-            if any(x in header for x in ("target", "to", "destination", "dest", "dst")):
-                hint += 0.02
-            scores.append((ratio + hint, matches, col))
+            values=[str(r.get(col,'')).strip() for r in rows if str(r.get(col,'')).strip()]
+            if not values: continue
+            matches=sum(v in node_ids or v.casefold() in names for v in values)
+            ranked.append((matches/len(values),matches,col))
+        ranked.sort(reverse=True)
+        return (ranked[0][2],ranked[1][2]) if len(ranked)>1 and ranked[1][1]>0 else None
 
-        scores.sort(reverse=True)
-        if len(scores) < 2 or scores[0][1] == 0 or scores[1][1] == 0:
-            return None
-
-        return scores[0][2], scores[1][2]
+    def _resolve_evidence_person(self, value):
+        """Resolve unique, exact town names; never merge ambiguous homonyms."""
+        value=str(value).strip()
+        if value in self.G: return value
+        current=[n for n,d in self.G.nodes(data=True) if str(d.get('label','')).casefold()==value.casefold()]
+        if len(current)==1: return current[0]
+        if len(current)>1: return None
+        candidates=self.town.candidates(value,'person') if self.town.count() else []
+        exact=[row for row,score in candidates if row['name'].casefold()==value.casefold()]
+        if len(exact)!=1: return None
+        return exact[0]['id']
 
     # Column-name candidates (lowercased) that represent relationship
     # *strength* for common investigation data: call duration and
@@ -3130,9 +3527,9 @@ class CriminalNetworkAnalyst:
                 return properties[key].strip()
 
         filename = str(path).lower()
-        if any(x in filename for x in ("cdr", "call", "phone")):
+        if any(x in filename for x in ("cdr", "call", "phone")) or 'calling person' in [x.lower() for x in fieldnames]:
             return "Calls"
-        if any(x in filename for x in ("financial", "transaction", "payment", "money")):
+        if any(x in filename for x in ("financial", "transaction", "payment", "money")) or 'sender' in [x.lower() for x in fieldnames]:
             return "Transactions"
         return "Linked to"
 
@@ -3161,6 +3558,8 @@ class CriminalNetworkAnalyst:
         for path in paths:
             added = 0
             skipped = 0
+            skip_reasons = {"unresolved_identity": 0,
+                            "same_person": 0, "missing_endpoint": 0}
 
             try:
                 with open(path, newline='', encoding='utf-8-sig') as f:
@@ -3195,23 +3594,28 @@ class CriminalNetworkAnalyst:
 
                     if not src or not tgt:
                         skipped += 1
+                        skip_reasons["missing_endpoint"] += 1
                         skipped_details.append(
                             f"{Path(path).name}, row {row_number}: missing endpoint"
                         )
                         continue
 
-                    if src not in self.G.nodes or tgt not in self.G.nodes:
+                    src_id = self._resolve_evidence_person(src)
+                    tgt_id = self._resolve_evidence_person(tgt)
+                    if not src_id or not tgt_id:
                         skipped += 1
-                        missing = []
-                        if src not in self.G.nodes:
-                            missing.append(f"{source_col}='{src}'")
-                        if tgt not in self.G.nodes:
-                            missing.append(f"{target_col}='{tgt}'")
-                        skipped_details.append(
-                            f"{Path(path).name}, row {row_number}: node not found "
-                            f"({', '.join(missing)})"
-                        )
+                        skip_reasons["unresolved_identity"] += 1
                         continue
+                    if src_id == tgt_id:
+                        skipped += 1
+                        skip_reasons["same_person"] += 1
+                        continue
+                    # Every supplied record is case evidence. Bring both resolved
+                    # citizen endpoints into the graph, even if neither was in an FIR.
+                    for nid in (src_id,tgt_id):
+                        if nid not in self.G and self.town.get(nid):
+                            self._materialize_citizen(nid)
+                    src,tgt=src_id,tgt_id
 
                     properties = {
                         col: self._normalise_csv_value(row.get(col, ""))
@@ -3251,6 +3655,9 @@ class CriminalNetworkAnalyst:
                 file_summaries.append(
                     f"{Path(path).name}: {added} links added, {skipped} skipped "
                     f"({source_col} -> {target_col}; relation: {filename_relation}{weight_note})"
+                    f"\n  Skipped breakdown: unresolved/ambiguous name={skip_reasons['unresolved_identity']}, "
+                    f"same person={skip_reasons['same_person']}, "
+                    f"missing name={skip_reasons['missing_endpoint']}"
                 )
                 total_added += added
                 total_skipped += skipped
@@ -3498,18 +3905,6 @@ class CriminalNetworkAnalyst:
 
     def _build_ai_panel(self):
         """Build the AI Copilot inside the existing right-side panel."""
-        tk.Label(self.ai_tab, text="AI SPECIALISTS", bg="#404040", fg="white",
-                 font=("Arial", 9, "bold")).pack(fill=tk.X, pady=(6, 0))
-        self.ai_agents_box = tk.Text(self.ai_tab, height=4, wrap="word", bg="#f5f5f5",
-                                     fg="black", relief=tk.SUNKEN, bd=1, font=("Arial", 8))
-        self.ai_agents_box.pack(fill=tk.X, padx=5, pady=4)
-        self._render_ai_agents()
-
-        fir_row = tk.Frame(self.ai_tab, bg="#d9d9d9")
-        fir_row.pack(fill=tk.X, padx=5, pady=(2, 4))
-        tk.Button(fir_row, text="📄 UPLOAD HANDWRITTEN FIR", bg="#66cccc",
-                  command=self.upload_fir).pack(fill=tk.X)
-
         action_row = tk.Frame(self.ai_tab, bg="#d9d9d9")
         action_row.pack(fill=tk.X, padx=5, pady=2)
         tk.Button(action_row, text="Explain Score", bg="#66cccc", command=self.ai_explain_selected).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(0, 2))
@@ -3519,22 +3914,6 @@ class CriminalNetworkAnalyst:
         action_row2.pack(fill=tk.X, padx=5, pady=2)
         tk.Button(action_row2, text="Show Evidence", command=self.ai_show_evidence).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(0, 2))
         tk.Button(action_row2, text="Challenge AI", command=self.ai_challenge).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(2, 0))
-
-        tk.Label(self.ai_tab, text="SUGGESTED QUESTIONS", bg="#404040", fg="white",
-                 font=("Arial", 9, "bold")).pack(fill=tk.X, pady=(6, 0))
-        questions = [
-            "Why is this entity important?",
-            "What anomalies involve this entity?",
-            "What evidence supports this score?",
-            "Why was this relationship predicted?",
-            "Who should I investigate next?",
-            "What evidence contradicts this hypothesis?",
-        ]
-        qbox = tk.Frame(self.ai_tab, bg="#d9d9d9")
-        qbox.pack(fill=tk.X, padx=5, pady=3)
-        for q in questions:
-            tk.Button(qbox, text=q, anchor="w", relief=tk.GROOVE,
-                      command=lambda text=q: self._ask_question(text)).pack(fill=tk.X, pady=1)
 
         # Bottom widgets are packed first so they are never pushed off-screen.
         self.ai_activity_var = tk.StringVar(value="AI ACTIVITY: ready")
@@ -3548,6 +3927,20 @@ class CriminalNetworkAnalyst:
         self.ai_input.bind("<Return>", lambda _e: self.ask_ai())
         tk.Button(input_row, text="✦ ASK AI", bg="#66cccc", command=self.ask_ai).pack(side=tk.RIGHT, padx=(4, 0))
 
+        # Pack below the response; dynamically updated with case-specific follow-ups.
+        self.question_panel = tk.Frame(self.ai_tab, bg="#d9d9d9")
+        self.question_panel.pack(side=tk.BOTTOM, fill=tk.X, padx=4, pady=(3, 4))
+        tk.Label(self.question_panel, text="SUGGESTED QUESTIONS", bg="#404040", fg="white",
+                 font=("Arial", 9, "bold")).pack(fill=tk.X)
+        self.question_buttons_frame = tk.Frame(self.question_panel, bg="#d9d9d9")
+        self.question_buttons_frame.pack(fill=tk.X)
+        self.standard_questions = [
+            "Why is this entity important?",
+            "What evidence supports this score?",
+            "Who should I investigate next?",
+        ]
+        self._update_suggested_questions([])
+
         tk.Label(self.ai_tab, text="✦ AI RESPONSE", bg="#404040", fg="white",
                  font=("Arial", 9, "bold")).pack(fill=tk.X, pady=(4, 0))
         self.ai_chat = tk.Text(self.ai_tab, height=8, wrap="word", bg="white", fg="black", relief=tk.SUNKEN,
@@ -3555,7 +3948,68 @@ class CriminalNetworkAnalyst:
         self.ai_chat.pack(fill=tk.BOTH, expand=True, padx=5, pady=4)
         self.ai_chat.insert("1.0", "AI Copilot ready. Select an entity or ask a question.\n\n"
                                    "This assistant queries the live graph and FIR evidence only when needed.\n")
+        self.ai_chat.tag_configure("chat_header", font=("Arial", 9, "bold"), foreground="#184e77")
         self.ai_chat.configure(state="disabled")
+
+    def _update_suggested_questions(self, dynamic_questions=None):
+        """Keep standard prompts and add case-grounded follow-ups after analysis."""
+        questions = list(self.standard_questions)
+        for q in (dynamic_questions or []):
+            q = str(q).strip().lstrip("•-0123456789. ")
+            if q and q.lower() not in {old.lower() for old in questions}:
+                questions.append(q[:145])
+            if len(questions) >= 6:
+                break
+        for widget in self.question_buttons_frame.winfo_children():
+            widget.destroy()
+        for question in questions:
+            tk.Button(self.question_buttons_frame, text=question, anchor="w",
+                      wraplength=390, justify=tk.LEFT, relief=tk.GROOVE,
+                      command=lambda q=question: self._ask_question(q)).pack(fill=tk.X, pady=1)
+
+    @staticmethod
+    def _parse_briefing(answer):
+        """Extract structured Gemini answer; gracefully handle ordinary-text fallback."""
+        raw = str(answer or "").strip()
+        raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.I)
+        try:
+            payload = json.loads(raw)
+            if isinstance(payload, dict) and isinstance(payload.get("gist"), str):
+                qs = payload.get("next_questions", [])
+                if not isinstance(qs, list):
+                    qs = []
+                return {"gist": payload.get("gist", ""),
+                        "hypothesis": payload.get("hypothesis", ""),
+                        "alternative": payload.get("alternative", ""),
+                        "next_questions": [str(x) for x in qs[:3]]}
+        except (ValueError, TypeError):
+            pass
+        # Don't display a huge raw response even if the model ignores JSON instructions.
+        sentences = re.split(r"(?<=[.!?])\s+", re.sub(r"\s+", " ", raw))
+        gist = " ".join(sentences[:3])[:650]
+        return {"gist": gist or "No analysis returned.",
+                "hypothesis": "No structured hypothesis was returned; review source evidence.",
+                "alternative": "Graph patterns alone do not establish criminal involvement.",
+                "next_questions": []}
+
+    def _show_node_briefing(self, answer, deterministic):
+        details = self._parse_briefing(answer)
+        components = deterministic.get("components", {})
+        # Percent values here are normalized signal contributions, not probabilities.
+        score_lines = [f"Evidence Association Score: {deterministic.get('score', 0):.0f}/100 (not guilt probability)"]
+        for key, value in components.items():
+            if isinstance(value, (float, int)):
+                score_lines.append(f"{key.replace('_', ' ').title()}: {value:.2f}")
+        text = ("SCORES\n" + "\n".join(score_lines) +
+                "\n\nANALYST GIST\n" + details["gist"].strip() +
+                "\n\nEVIDENCE EVALUATOR — HYPOTHESIS\n" + details["hypothesis"].strip() +
+                "\nAlternative / limitation: " + details["alternative"].strip())
+        # Keep the response focused on findings; follow-up questions belong only
+        # in the clickable Suggested Questions panel underneath the response.
+        qlist = details["next_questions"] or ["Which source records best corroborate this entity's role?",
+                                               "What competing explanation fits these connections?"]
+        self._append_ai_chat(text, header="ENTITY ANALYSIS")
+        self._update_suggested_questions(qlist)
 
     def _render_ai_agents(self, running=None):
         running = running or set()
@@ -3578,9 +4032,22 @@ class CriminalNetworkAnalyst:
         if hasattr(self, "ai_activity_var"):
             self.ai_activity_var.set("AI ACTIVITY: " + " | ".join(x.split("  ", 1)[-1] for x in self._ai_activity_lines[-2:]))
 
+    @staticmethod
+    def _plain_ai_text(value):
+        """Remove typical LLM Markdown while retaining paragraphs and lists."""
+        value = str(value or "")
+        value = re.sub(r"(?m)^\s{0,3}#{1,6}\s*", "", value)
+        value = re.sub(r"\*\*(.*?)\*\*", r"\1", value, flags=re.DOTALL)
+        value = re.sub(r"(?<!\w)__(.*?)__(?!\w)", r"\1", value, flags=re.DOTALL)
+        value = re.sub(r"(?m)^\s*[-*]\s+", "• ", value)
+        value = re.sub(r"`([^`]+)`", r"\1", value)
+        value = re.sub(r"(?m)^\s*```[^\n]*$", "", value)
+        return value.strip()
+
     def _append_ai_chat(self, text, header="AI"):
         self.ai_chat.configure(state="normal")
-        self.ai_chat.insert("end", f"\n{header}:\n{text}\n")
+        self.ai_chat.insert("end", f"\n{header}:\n", "chat_header")
+        self.ai_chat.insert("end", self._plain_ai_text(text) + "\n")
         self.ai_chat.see("end")
         self.ai_chat.configure(state="disabled")
 
@@ -3596,6 +4063,7 @@ class CriminalNetworkAnalyst:
                 f"Detected anomaly signals: {anomaly_count}\n\n"
                 f"Suggested: click 'Explain Score' or ask a question below.")
         self._append_ai_chat(text, header="✦ AI BRIEFING")
+        self._update_suggested_questions([f"Which links involving {label} have the strongest source evidence?"])
 
     # ---- Gemini settings (fixed in code) ----
 
@@ -3648,6 +4116,7 @@ class CriminalNetworkAnalyst:
         if self._ai_busy:
             return messagebox.showinfo("AI Busy", "The AI is already analyzing a request. Please wait for the response.")
         self.ai_input.delete(0, "end")
+        self._append_ai_chat(question, header="YOU")
         self._run_ai_async(question, deep=False)
 
     def _ask_question(self, text):
@@ -3680,9 +4149,7 @@ class CriminalNetworkAnalyst:
         self.ai._activity = getattr(self.ai, "_activity", [])
         if deep:
             answer, specialists, deterministic = result
-            self._append_ai_chat(answer, header="◆ EVIDENCE EVALUATOR")
-            self._append_ai_chat("Deterministic score: " + f"{deterministic['score']:.0f}/100\n" +
-                                 json.dumps(deterministic["components"], indent=2), header="SCORE TRACE")
+            self._show_node_briefing(answer, deterministic)
         else:
             self._append_ai_chat(str(result), header="✦ AI COPILOT")
         self._ai_activity("Response generated")
@@ -3800,6 +4267,89 @@ class CriminalNetworkAnalyst:
         self._append_ai_chat(question, header="YOU")
         self._run_ai_async(question, deep=False)
 
+    def initialize_town(self):
+        if self.town.count():
+            return messagebox.showinfo("Town Database",f"Existing registry: {self.town.count():,} citizens. No data overwritten.")
+        if messagebox.askyesno("Synthetic Town", "Create a database of 10,000 entirely fictional town citizens and sample social relationships?\nThis does not populate the investigation graph."):
+            n=self.town.seed_demo()
+            messagebox.showinfo("Town Database",f"Created {n:,} fictional citizens in {self.town.path}.\nNow upload an FIR to start an investigation.")
+
+    def import_town_citizens(self):
+        path=filedialog.askopenfilename(title="Town Citizens CSV",filetypes=[("CSV","*.csv")])
+        if not path: return
+        try: messagebox.showinfo("Town Database",f"Imported {self.town.import_citizens(path):,} citizen rows.\nThe case graph was not changed.")
+        except Exception as exc: messagebox.showerror("Town import failed",str(exc))
+
+    def import_town_ties(self):
+        path=filedialog.askopenfilename(title="Town Relationships CSV",filetypes=[("CSV","*.csv")])
+        if not path: return
+        try: messagebox.showinfo("Town Database",f"Imported {self.town.import_ties(path):,} known relationships.\nThe case graph was not changed.")
+        except Exception as exc: messagebox.showerror("Town import failed",str(exc))
+
+    def _materialize_citizen(self,cid):
+        row=self.town.get(cid)
+        if not row: return None
+        if cid not in self.G:
+            props=json.loads(row.get('details') or '{}')
+            props.update({'name':row['name'],'phone_number':row.get('phone') or '',
+                          'address':row.get('address') or '', '_town_id':cid,'_source_type':'Town Registry'})
+            self.add_entity(row['name'],'Person',node_id=cid,properties=props,redraw=False)
+        return cid
+
+    def _review_town_entities(self, entities):
+        """Match FIR entities with Yes/No confirmation; do not mutate graph yet."""
+        decisions = {}
+        for i, item in enumerate(entities):
+            value = str(item.get('value', item.get('name', ''))).strip()
+            etype = str(item.get('type', '')).lower()
+            matches = self.town.candidates(value, etype)
+            if not matches:
+                decisions[i] = {'action': 'create', 'node_id': None, 'score': 0}
+                continue
+            # Ask Yes/No for every candidate in descending order. Names alone
+            # are not proof of identity, even with a 100% similarity score.
+            decisions[i] = {'action': 'create', 'node_id': None, 'score': 0}
+            for row, score in matches[:8]:
+                reply = messagebox.askyesnocancel(
+                    'Confirm FIR Identity',
+                    f"FIR mentions: {value} ({etype})\n\n"
+                    f"Is this the same person as the town citizen below?\n\n"
+                    f"Name: {row['name']}\n"
+                    f"Registry ID: {row['id']}\n"
+                    f"Address: {row.get('address', '')}\n"
+                    f"Name similarity: {score}%\n\n"
+                    'YES = use this citizen\n'
+                    'NO = not this citizen (check next match or create new)\n'
+                    'CANCEL = stop FIR import',
+                    parent=self.root,
+                )
+                if reply is None:
+                    raise RuntimeError('FIR matching cancelled by investigator.')
+                if reply:
+                    decisions[i] = {'action': 'merge', 'node_id': row['id'], 'score': score}
+                    break
+        return decisions
+
+    def _load_known_case_ties(self):
+        """Only show registry relationships when BOTH citizens appear in case graph."""
+        ids=[n for n,d in self.G.nodes(data=True) if d.get('properties',{}).get('_town_id')]
+        added=0
+        for cid in ids:
+            for other,rel in self.town.neighbors(cid,limit=80):
+                if other in self.G and not any(e.get('label')==rel for e in (self.G.get_edge_data(cid,other) or {}).values()):
+                    self.add_link(cid,other,rel,source='town_registry',confidence=1.0,properties={'_source_type':'Town Registry'},redraw=False)
+                    added+=1
+        return added
+
+    def _request_case_records(self,case_id,entity_nodes):
+        """Optional guided evidence collection following FIR ingestion."""
+        people=sorted({n for n in entity_nodes.values() if n in self.G and self.G.nodes[n].get('type','').lower() in ('person','suspect','entity')})
+        names=', '.join(f"{self.G.nodes[n].get('label',n)} ({n})" for n in people[:7]) or 'the matched entities'
+        if messagebox.askyesno('Next Step — CDR Evidence',f"FIR {case_id} integrated.\nRelevant people: {names}\n\nUpload CDR relationship CSV files now?\nYou can also import them later from DATA IN."):
+            self.import_relationships_csv()
+        if messagebox.askyesno('Next Step — Financial Evidence','Upload financial transaction relationship CSV files now?\nSelect one or multiple CSV files in the file dialog.\nYou can also import them later from DATA IN.'):
+            self.import_relationships_csv()
+
     def _fuzzy_fir_candidate(self, entity_type, value):
         """Return the best existing node label match and its ratio score."""
         if not HAS_THEFUZZ:
@@ -3908,78 +4458,60 @@ class CriminalNetworkAnalyst:
         return decisions
 
     def _integrate_fir_entities(self, case_id, path, structured, decisions=None):
+        """Create only extracted entity nodes. FIRs are stored as documents, not graph nodes.
+
+        No relationship of any kind is introduced by this function. The only
+        relationships shown in the investigation graph come from uploaded CDR
+        or financial CSV data.
+        """
         decisions = decisions or {}
         entity_nodes = {}
-        created = 0
-        matched = 0
-        added_links = 0
+        created = matched = 0
         source_file = Path(path).name
-
-        for index, item in enumerate(structured.get("entities", [])):
-            etype = str(item.get("type", "Entity")).lower()
-            value = str(item.get("value", item.get("name", ""))).strip()
+        for index, item in enumerate(structured.get('entities', [])):
+            etype = str(item.get('type', 'Entity')).lower()
+            value = str(item.get('value', item.get('name', ''))).strip()
             if not value:
                 continue
-            decision = decisions.get(index, {"action": "create", "node_id": None})
-            existing = decision.get("node_id") if decision.get("action") == "merge" else None
-            if existing is not None and existing not in self.G:
-                existing = None
-
+            decision = decisions.get(index, {'action': 'create', 'node_id': None})
+            existing = decision.get('node_id') if decision.get('action') == 'merge' else None
+            if existing and existing not in self.G:
+                existing = self._materialize_citizen(existing)
             if existing is None:
-                node_type = FIRProcessor.ENTITY_TYPE_MAP.get(etype, FIRProcessor._canonical_type(etype))
+                # Do not duplicate the same previously extracted case-only entity
+                # in another FIR. Preserve distinct entity types.
+                norm = FIRProcessor._normalise_value(value)
+                for n, data in self.G.nodes(data=True):
+                    if (FIRProcessor._normalise_value(data.get('label', n)) == norm
+                            and str(data.get('type', '')).lower() in (etype, FIRProcessor._canonical_type(etype).lower())):
+                        existing = n
+                        break
+            if existing is None:
+                node_type = FIRProcessor._canonical_type(etype)
                 existing = self.add_entity(
-                    label=value,
-                    e_type=node_type,
-                    node_id=f"FIR_{case_id}_{etype}_{len(entity_nodes)+1}",
+                    label=value, e_type=node_type,
+                    node_id=f"FIR_ENTITY_{case_id}_{etype}_{index+1}",
                     properties={
-                        "value": value,
-                        "entity_type": node_type,
-                        "is_ambiguous": bool(item.get("is_ambiguous", False)),
-                        "match_score": int(decision.get("score", 0) or 0),
-                        "_source_file": source_file,
-                        "_source_type": "FIR",
-                        "_fir_id": case_id,
+                        'value': value,
+                        'entity_type': node_type,
+                        'is_ambiguous': bool(item.get('is_ambiguous', False)),
+                        '_source_file': source_file,
+                        '_source_type': 'FIR',
+                        'fir_mentions': [case_id],
                     },
-                    x=420 + 40 * len(entity_nodes), y=280,
-                    redraw=False,
+                    x=350 + 45 * index, y=260 + 30 * (index % 3), redraw=False,
                 )
                 created += 1
             else:
                 matched += 1
-                self.G.nodes[existing].setdefault("properties", {})[f"fir_{case_id}"] = value
-                self.G.nodes[existing]["properties"][f"fir_{case_id}_match_score"] = int(decision.get("score", 0) or 0)
-                self.G.nodes[existing]["properties"][f"fir_{case_id}_ambiguous"] = bool(item.get("is_ambiguous", False))
-
+            props = self.G.nodes[existing].setdefault('properties', {})
+            mentions = props.setdefault('fir_mentions', [])
+            if case_id not in mentions:
+                mentions.append(case_id)
+            props[f'fir_{case_id}_name'] = value
+            props[f'fir_{case_id}_match_score'] = int(decision.get('score', 0) or 0)
             entity_nodes[FIRProcessor._normalise_value(value)] = existing
-            self.add_link(
-                case_id, existing, "Contains evidence",
-                source="fir_extraction", confidence=0.90 if decision.get("action") == "merge" else 0.80, weight=1.0,
-                properties={
-                    "_source_file": source_file,
-                    "_source_type": "FIR",
-                    "_fir_id": case_id,
-                    "entity_type": etype,
-                    "matched_existing": bool(decision.get("action") == "merge"),
-                    "match_score": int(decision.get("score", 0) or 0),
-                    "value": value,
-                }, redraw=False,
-            )
-            added_links += 1
-
-        # Add explicitly stated relationships only after entity resolution.
-        for rel in structured.get("relationships", []):
-            a = entity_nodes.get(FIRProcessor._normalise_value(rel.get("from", "")))
-            b = entity_nodes.get(FIRProcessor._normalise_value(rel.get("to", "")))
-            if not a or not b or a == b:
-                continue
-            self.add_link(
-                a, b, rel.get("relation") or "Associated with",
-                source="fir_extraction", confidence=0.78, weight=1.0,
-                properties={"_source_file": source_file, "_source_type": "FIR", "_fir_id": case_id},
-                redraw=False,
-            )
-            added_links += 1
-        return created, matched, added_links, entity_nodes
+        return created, matched, 0, entity_nodes
 
     def upload_fir(self):
         path = filedialog.askopenfilename(
@@ -3998,7 +4530,7 @@ class CriminalNetworkAnalyst:
         self._fir_busy = True
         self._apply_ai_settings()   # make sure the latest Gemini key is used for OCR
         # AI Copilot remains visible alongside the inspector.
-        self._ai_activity("FIR received — Gemini OCR starting")
+        self._ai_activity("FIR received — extracting named entities")
         self._append_ai_chat(f"Processing scanned FIR: {Path(path).name}", header="YOU")
         self.ai_status_var.set("… FIR OCR WORKING")
 
@@ -4036,49 +4568,16 @@ class CriminalNetworkAnalyst:
 
             doc = self.evidence_store.add_fir(path, text, structured.get("entities", []))
             case_id = doc["id"]
-            case_props = {
-                "document": Path(path).name,
-                "transcribed_text_file": transcription_path or "",
-                "extracted_chars": len(text),
-                "ocr_engine": backend,
-                "extracted_entities": len(structured.get("entities", [])),
-                "ocr_text": text[:12000],
-                "cloud_error": cloud_error,
-                "_source_file": Path(path).name,
-                "_source_type": "FIR",
-            }
-            self.add_entity(
-                Path(path).stem, "Case/FIR", 360, 240,
-                properties=case_props, node_id=case_id, redraw=False,
-            )
-
-            # Resolve entities against existing graph labels. >92% auto-merges;
-            # 75-92% and ambiguous handwriting require a manual Merge/Create-New decision.
-            decisions = self._review_fir_matches(structured.get("entities", []))
-            self._ai_activity("Entity resolution complete — updating graph")
+            # Keep the FIR and transcription in EvidenceStore only. It is not
+            # a graph entity, and its textual mentions do not create edges.
+            decisions = (self._review_town_entities(structured.get("entities", []))
+                         if self.town.count() else self._review_fir_matches(structured.get("entities", [])))
+            self._ai_activity("Entity resolution complete — adding FIR people")
             created, matched, added_links, entity_nodes = self._integrate_fir_entities(
                 case_id, path, structured, decisions=decisions
             )
-
-            # Exact textual mentions remain useful evidence even when no structured entity was emitted.
-            lowered = text.lower()
-            exact_mentions = 0
-            for node_id, data in list(self.G.nodes(data=True)):
-                if node_id == case_id:
-                    continue
-                label = str(data.get("label", node_id))
-                if len(label) >= 4 and label.lower() in lowered:
-                    self.add_link(
-                        case_id, node_id, "Mentions", source="fir_text_match",
-                        confidence=0.82, weight=1.0,
-                        properties={
-                            "_source_file": Path(path).name,
-                            "_source_type": "FIR",
-                            "match": label,
-                            "_fir_id": case_id,
-                        }, redraw=False,
-                    )
-                    exact_mentions += 1
+            # Existing CDR/financial links are preserved. No town-registry,
+            # FIR-mention, or FIR-relationship links are added.
 
             # Re-run all graph analysis immediately after FIR integration.
             try:
@@ -4110,10 +4609,10 @@ class CriminalNetworkAnalyst:
                 f"Entities extracted: {len(structured.get('entities', []))}\n"
                 f"Existing entities merged: {matched}\n"
                 f"New entities added: {created}\n"
-                f"Relationships/evidence links added: {added_links + exact_mentions}"
+                "New relationships added from FIR: 0"
                 f"{fallback_note}\n\n"
-                "The graph and anomaly signals have been updated automatically.\n"
-                "Fuzzy matches above 92% were auto-merged; ambiguous/75-92% matches were reviewed manually."
+                "Only extracted entities were added to the graph; FIRs do not add relationships.\n"
+                "Town matches were investigator-reviewed when the town registry was populated."
             )
             self._append_ai_chat(summary, header="✦ FIR → GRAPH")
             if self.selected_node not in self.G and entity_nodes:
@@ -4135,6 +4634,7 @@ class CriminalNetworkAnalyst:
 def _on_close(root, app):
     try:
         app.neo4j.close()
+        app.town.close()
     finally:
         root.destroy()
 
