@@ -14,6 +14,10 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 import os
 import sqlite3
 import difflib
+from typing import Any, cast
+
+genai: Any = None
+genai_types: Any = None
 
 try:
     from google import genai
@@ -24,6 +28,9 @@ except ImportError:
     genai_types = None
     HAS_GEMINI_SDK = False
 
+BaseModel: Any = object
+Field: Any = None
+
 try:
     from pydantic import BaseModel, Field
     HAS_PYDANTIC = True
@@ -31,6 +38,10 @@ except ImportError:
     BaseModel = object
     Field = None
     HAS_PYDANTIC = False
+
+retry: Any = None
+stop_after_attempt: Any = None
+wait_exponential: Any = None
 
 try:
     from tenacity import retry, stop_after_attempt, wait_exponential
@@ -40,6 +51,8 @@ except ImportError:
     stop_after_attempt = None
     wait_exponential = None
     HAS_TENACITY = False
+
+fuzz: Any = None
 
 try:
     from thefuzz import fuzz
@@ -53,6 +66,8 @@ try:
     HAS_REQUESTS = True
 except ImportError:
     HAS_REQUESTS = False
+
+Image: Any = None
 
 try:
     from PIL import Image
@@ -593,7 +608,7 @@ class FIRProcessor:
             doc = fitz.open(path)
             text_parts = []
             for page in doc:
-                text = page.get_text("text")
+                text = cast(str, page.get_text("text"))
                 if text.strip():
                     text_parts.append(text)
                 elif HAS_PIL and HAS_TESSERACT:
@@ -1034,7 +1049,9 @@ class AnomalyEngine:
         H = nx.Graph()
         H.add_nodes_from(G.nodes())
         H.add_edges_from((u, v) for u, v in G.edges())
-        triangles = nx.triangles(H) if H.number_of_nodes() else {}
+        triangles: dict[Any, int] = cast(
+            dict[Any, int], nx.triangles(H) if H.number_of_nodes() else {}
+        )
         for n in G.nodes():
             tri = triangles.get(n, 0)
             deg = H.degree(n)
@@ -1246,7 +1263,7 @@ class GeminiBackend:
         if not use_sdk and not HAS_REQUESTS:
             raise GeminiError("Install google-genai (pip install google-genai) or requests.")
 
-        last = None
+        last: Any = None
         for attempt in range(3):
             try:
                 if use_sdk:
@@ -1566,7 +1583,7 @@ class Neo4jSync:
     in-memory investigation graph into a real Neo4j database."""
 
     def __init__(self):
-        self.driver = None
+        self.driver: Any = None
         self.connected = False
         self.uri = None
         self.database = None
@@ -1828,7 +1845,7 @@ class CriminalNetworkAnalyst:
         self._apply_ai_settings()
         self._ai_busy = False
         self._ai_activity_lines = []
-        self.ai = None
+        self.ai: Any = None
         self._suspend_ai_snapshot = False
 
         # UI State
@@ -2691,7 +2708,7 @@ class CriminalNetworkAnalyst:
 
                 self.canvas.create_line(
                     x1 + ox, y1 + oy, x2 + ox, y2 + oy,
-                    fill=fill, width=width, dash=dash,
+                    fill=fill, width=width, dash=dash,  # type: ignore[arg-type]
                     arrow=tk.LAST, arrowshape=(8, 10, 3),
                     tags=(tag, "edge")
                 )
@@ -2731,7 +2748,7 @@ class CriminalNetworkAnalyst:
             self.canvas.create_oval(
                 x - r, y - r, x + r, y + r,
                 fill=fill_color, outline=outline, width=width,
-                tags=(node_id, "entity")
+                tags=(node_id, "entity")  # type: ignore[arg-type]
             )
 
             label = str(data.get('label', node_id))
@@ -2741,7 +2758,7 @@ class CriminalNetworkAnalyst:
             self.canvas.create_text(
                 x, y, text=label, fill="white",
                 font=("Arial", font_size, "bold"),
-                tags=(node_id, "entity")
+                tags=(node_id, "entity")  # type: ignore[arg-type]
             )
 
         zoom = float(self.graph_zoom.get())
@@ -2754,7 +2771,7 @@ class CriminalNetworkAnalyst:
 
     def _node_at(self, event):
         item = self.canvas.find_closest(event.x, event.y)
-        tags = self.canvas.gettags(item)
+        tags = self.canvas.gettags(item)  # type: ignore[arg-type]
         for t in tags:
             if t in self.G.nodes:
                 return t
@@ -2763,7 +2780,7 @@ class CriminalNetworkAnalyst:
     def _edge_at(self, event):
         """Return the specific edge nearest the click, if its canvas item is tagged."""
         item = self.canvas.find_closest(event.x, event.y)
-        tags = self.canvas.gettags(item)
+        tags = self.canvas.gettags(item)  # type: ignore[arg-type]
         for tag in tags:
             if isinstance(tag, str) and tag.startswith("edge:"):
                 parts = tag.split(":", 3)
@@ -3624,7 +3641,7 @@ class CriminalNetworkAnalyst:
                         and self._normalise_csv_value(row.get(col, "")) != ""
                     }
                     properties["_source_file"] = Path(path).name
-                    properties["_row"] = row_number
+                    properties["_row"] = row_number  # type: ignore[reportArgumentType]
                     properties["_source_type"] = "CSV"
 
                     # Prefer an explicit per-row relation. Otherwise use the
@@ -3733,7 +3750,7 @@ class CriminalNetworkAnalyst:
                     }
                     properties[id_col] = node_id
                     properties["_source_file"] = Path(path).name
-                    properties["_row"] = row_number
+                    properties["_row"] = row_number  # type: ignore[reportArgumentType]
                     properties["_source_type"] = "CSV"
 
                     # Optional display type is taken from a row value if present,
@@ -4013,18 +4030,19 @@ class CriminalNetworkAnalyst:
 
     def _render_ai_agents(self, running=None):
         running = running or set()
-        if not hasattr(self, "ai_agents_box"):
+        ai_agents_box = getattr(self, "ai_agents_box", None)
+        if ai_agents_box is None:
             return
-        self.ai_agents_box.configure(state="normal")
-        self.ai_agents_box.delete("1.0", "end")
+        ai_agents_box.configure(state="normal")
+        ai_agents_box.delete("1.0", "end")
         lines = [
             f"{'●' if 'network' not in running else '…'} LLM 1 — Criminology Specialist",
             f"{'●' if 'temporal' not in running else '…'} LLM 2 — Temporal Pattern Expert",
             f"{'●' if 'context' not in running else '…'} LLM 3 — Demographic / Context Analyst",
             "◆ Evidence Evaluator — composite explanation",
         ]
-        self.ai_agents_box.insert("1.0", "\n".join(lines))
-        self.ai_agents_box.configure(state="disabled")
+        ai_agents_box.insert("1.0", "\n".join(lines))
+        ai_agents_box.configure(state="disabled")
 
     def _ai_activity(self, text):
         self._ai_activity_lines.append(time.strftime("%H:%M:%S") + "  " + text)
